@@ -24,8 +24,9 @@ while True:
     elif event == '-FILE-':
         # Enable the Read File button when a file is selected
         window['-READ-'].update(disabled=False)
+        file_path = values['-FILE-']
     elif event == '-READ-':
         # Handle the file reading logic here
         file_path = values['-FILE-']
         mode = 'Mode 1' if values['-MODE1-'] else 'Mode 2' if values['-MODE2-'] else 'Mode 3'
-        sg.popup(f'Reading file: {file_path}\nSelected mode: {mode}')
+        dp.read_semg_data(file_path, mode)

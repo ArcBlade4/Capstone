@@ -29,6 +29,7 @@ def read_semg_data(file_path, mode):
             f"bytes2-7={packets[i, 2:8].tolist()} "
             f"end={packets[i, 96:98].tolist()}"
         )
+    main(file_path, mode)
 
 def keep_last_100_packets(file_path):
     PACKET_SIZE = 98
