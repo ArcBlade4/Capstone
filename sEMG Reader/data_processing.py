@@ -5,6 +5,8 @@ import time
 import matplotlib.pyplot as plt
 import EMGFlow
 
+running = True
+
 # Define a function to read the sEMG data from a Dat file
 def read_semg_data(file_path, mode):
     with open(file_path, 'rb') as f:
@@ -29,40 +31,24 @@ def read_semg_data(file_path, mode):
             f"bytes2-7={packets[i, 2:8].tolist()} "
             f"end={packets[i, 96:98].tolist()}"
         )
-    main(file_path, mode)
+    
 
-def keep_last_100_packets(file_path):
-    PACKET_SIZE = 98
-
-    with open(file_path, "rb") as file:
-        data = file.read()
-
-    # Get complete packets
-    packets = [
-        data[i:i + PACKET_SIZE]
-        for i in range(0, len(data) - PACKET_SIZE + 1, PACKET_SIZE)
-    ]
-
-    # Keep only the newest 100
-    packets = packets[-100:]
-
-    with open(file_path, "wb") as file:
-        file.write(b"".join(packets))
 
 # Define main function to read the sEMG data
-def main(file_path, mode):
-    last_size = 0
-    index = 0
+def init(file_path, mode):
+    file_path = file_path
+    mode = mode
+    read_semg_data(file_path, mode)
 
+def monitor_file_size(file_path, last_size, index):
 
-    while True:
+    rint("Thread started")
+
+    while running:
         size = os.path.getsize(file_path)
+        last_size = size
+        index += 1
+        print(f"File size: {size} bytes, Index: {index}")
+   
 
-        if size != last_size:
-            print(f"{index}: File size: {size} bytes (+{size - last_size})")
-            last_size = size
-            index += 1
-        keep_last_100_packets(file_path)
-
-
-        time.sleep(0.1) # Sleep for 100 milliseconds to avoid busy waiting
+    return last_size, index

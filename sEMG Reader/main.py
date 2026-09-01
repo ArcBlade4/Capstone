@@ -1,5 +1,12 @@
 import PySimpleGUI as sg
 import data_processing as dp
+import threading 
+
+
+running = False
+last_size = 0
+index = 0
+
 
 # Define the layout of the GUI
 layout = [
@@ -18,6 +25,7 @@ window = sg.Window('sEMG Reader', layout)
 
 # Event loop to process events and get the values of the inputs
 while True:
+    
     event, values = window.read()
     if event == sg.WINDOW_CLOSED:
         break
@@ -29,4 +37,10 @@ while True:
         # Handle the file reading logic here
         file_path = values['-FILE-']
         mode = 'Mode 1' if values['-MODE1-'] else 'Mode 2' if values['-MODE2-'] else 'Mode 3'
-        dp.read_semg_data(file_path, mode)
+        dp.init(file_path, mode)
+        dp.monitor_file_size(file_path, last_size, index)
+        threading.Thread(target=dp.monitor_file_size, args=(file_path, last_size, index))
+
+    
+        
+
