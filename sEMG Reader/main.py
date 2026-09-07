@@ -8,7 +8,7 @@ FILE_PATH = input("Enter the path to save the CSV file: ")
 BAUDRATE = 115200
 START_TIME = time.perf_counter()
 
-paused = FalseC
+paused = False
 pause_started_at = None
 total_paused = 0.0
 
