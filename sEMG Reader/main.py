@@ -79,8 +79,7 @@ try:
                     else:
                         for i in range(len(split_data)):
                             split_data[i] = int(split_data[i])
-                            split_data[i] = split_data[i] / 100.0
-                            split_data[i] = round(split_data[i], 0)
+
                         time.sleep(0.1)
                         ser.reset_input_buffer()
                         data_time = round(time_since_start(),2)
