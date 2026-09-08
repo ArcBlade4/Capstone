@@ -2,6 +2,9 @@ import serial
 import time
 from pynput import keyboard
 import pandas as pd
+import asyncio
+
+
 
 PORT = input("Enter the serial port: ")
 FILE_PATH = input("Enter the path to save the CSV file: ")
@@ -53,48 +56,67 @@ def on_release(key):
 listener = keyboard.Listener(on_press=on_press, on_release=on_release)
 listener.start()
 
+
+
+
+async def main(ms, task):
+    loop = asyncio.get_running_loop()
+    interval = ms/1000
+    next_time = loop.time() + interval
+    while listener.running:
+        delay = next_time - loop.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        try:
+            await read_serial(ser)
+        except Exception as e:
+            print(f"Error in task: {e}")
+        next_time += interval
+        
+    
+
+        
+        
+    
+async def read_serial(ser):
+    if paused:
+        ser.reset_input_buffer()
+        time.sleep(0.1)
+    elif ser.in_waiting > 0:
+        raw_data = ser.readline()
+        try:
+            decoded_data = raw_data.decode('utf-8').strip()
+            split_data = decoded_data.split(' ')
+            if len(split_data) != 8:
+                print(f"Unexpected data length: {decoded_data}")
+            else:
+                for i in range(len(split_data)):
+                    split_data[i] = int(split_data[i])
+                time.sleep(0.1)
+                ser.reset_input_buffer()
+                data_time = round(time_since_start(),2)
+                data_time *= 1000
+                print(f"Received: {split_data} at {data_time} ms since start.")
+                save_to_csv(FILE_PATH, [data_time] + split_data)
+        except UnicodeDecodeError:
+            print("Received data could not be decoded.")
+                
+
 try:
     with serial.Serial(PORT, BAUDRATE, timeout=1) as ser:
         print(f"Connected to {PORT} at {BAUDRATE} baud.")
         print("Press 'p' to pause/resume reading, 'Esc' to quit.")
         ser.reset_input_buffer()
-        create_csv_file(FILE_PATH)
-        while listener.running:
-            if paused:
-                ser.reset_input_buffer()
-                time.sleep(0.1)
-                continue
-
-            if ser.in_waiting > 0:
-                raw_data = ser.readline()
-
-
-                
-                try:
-                    decoded_data = raw_data.decode('utf-8').strip()
-                    split_data = decoded_data.split(' ')
-                    if len(split_data) != 8:
-                        print(f"Unexpected data length: {decoded_data}")
-                        continue
-                    else:
-                        for i in range(len(split_data)):
-                            split_data[i] = int(split_data[i])
-
-                        time.sleep(0.1)
-                        ser.reset_input_buffer()
-                        data_time = round(time_since_start(),2)
-
-                        print(f"Received: {split_data} at {data_time} seconds since start.")
-                        save_to_csv(FILE_PATH, [data_time] + split_data)
-                        
-
-                except UnicodeDecodeError:
-                    print("Received data could not be decoded.")
-                    continue
-
+        create_csv_file(FILE_PATH)            
+        asyncio.run(main(50, read_serial(ser)))
 except serial.SerialException as e:
     print(f"Error opening or using serial port: {e}")
 except KeyboardInterrupt:
     print("\nProgram stopped by user.")
 finally:
     listener.stop()
+
+
+
+
+
