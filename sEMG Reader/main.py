@@ -3,6 +3,7 @@ import time
 from pynput import keyboard
 import pandas as pd
 import asyncio
+import EMGFlow
 
 
 
@@ -59,19 +60,19 @@ listener.start()
 
 
 
-async def main(ms, task):
-    loop = asyncio.get_running_loop()
+async def main(ms):
     interval = ms/1000
-    next_time = loop.time() + interval
+    next_time = time.monotonic()
     while listener.running:
-        delay = next_time - loop.time()
-        if delay > 0:
-            await asyncio.sleep(delay)
-        try:
-            await read_serial(ser)
-        except Exception as e:
-            print(f"Error in task: {e}")
         next_time += interval
+
+        await read_serial(ser)
+
+        remaining_time = next_time - time.monotonic()
+        if remaining_time > 0 :
+            await asyncio.sleep(remaining_time)
+        else:
+            next_time = time.monotonic()
         
     
 
@@ -88,14 +89,14 @@ async def read_serial(ser):
             decoded_data = raw_data.decode('utf-8').strip()
             split_data = decoded_data.split(' ')
             if len(split_data) != 8:
-                print(f"Unexpected data length: {decoded_data}")
+                pass
             else:
                 for i in range(len(split_data)):
                     split_data[i] = int(split_data[i])
-                time.sleep(0.1)
                 ser.reset_input_buffer()
-                data_time = round(time_since_start(),2)
+                data_time = time_since_start()
                 data_time *= 1000
+                data_time = round(data_time,0)
                 print(f"Received: {split_data} at {data_time} ms since start.")
                 save_to_csv(FILE_PATH, [data_time] + split_data)
         except UnicodeDecodeError:
@@ -108,7 +109,8 @@ try:
         print("Press 'p' to pause/resume reading, 'Esc' to quit.")
         ser.reset_input_buffer()
         create_csv_file(FILE_PATH)            
-        asyncio.run(main(50, read_serial(ser)))
+        asyncio.run(main(50))
+        
 except serial.SerialException as e:
     print(f"Error opening or using serial port: {e}")
 except KeyboardInterrupt:
