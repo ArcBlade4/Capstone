@@ -75,10 +75,9 @@ async def main(ms):
         remaining_time = next_time - time.monotonic()
         if remaining_time > 0 :
             await asyncio.sleep(remaining_time)
-        else:
-            
+        else: 
             next_time = time.monotonic()
-            
+
         await read_serial(ser)
         
     
