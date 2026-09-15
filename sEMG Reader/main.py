@@ -3,7 +3,6 @@ import time
 from pynput import keyboard
 import pandas as pd
 import asyncio
-import EMGFlow
 
 
 
@@ -53,7 +52,12 @@ def on_press(key):
 def on_release(key):
     # Stop the listener (and the program) if Escape is pressed
     if key == keyboard.Key.esc:
+        print(f"\n---Stopping program---\n")
         return False
+    
+
+
+    
 listener = keyboard.Listener(on_press=on_press, on_release=on_release)
 listener.start()
 
@@ -66,13 +70,16 @@ async def main(ms):
     while listener.running:
         next_time += interval
 
-        await read_serial(ser)
+        
 
         remaining_time = next_time - time.monotonic()
         if remaining_time > 0 :
             await asyncio.sleep(remaining_time)
         else:
+            
             next_time = time.monotonic()
+            
+        await read_serial(ser)
         
     
 
