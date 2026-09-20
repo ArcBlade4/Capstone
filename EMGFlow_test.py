@@ -3,7 +3,7 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 
-file_path = 'franticData.csv'
+file_path = 'emgflow_test1.csv'
 df = pd.read_csv(file_path)
 
 sampling_rate = 500
