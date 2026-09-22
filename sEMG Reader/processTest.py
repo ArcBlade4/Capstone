@@ -43,10 +43,10 @@ def serial_reader(port, baudrate, shared_values, new_data_flag, paused_flag,
                     with shared_values.get_lock():
                         shared_values[:] = values
                         new_data_flag.value = 1
-    except serial.SerialException as e:
-        error_queue.put(str(e))
-        stop_event.set()
-        return
+        except serial.SerialException as e:
+                error_queue.put(str(e))
+                stop_event.set()
+                return
 
     ready_event.set()
 
