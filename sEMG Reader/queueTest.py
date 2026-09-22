@@ -1,5 +1,7 @@
-﻿import serial
+import serial
 import time
+import multiprocessing as mp
+import csv
 import multiprocessing as mp
 import csv
 from pynput import keyboard
@@ -19,6 +21,28 @@ def serial_reader(port, baudrate, shared_values, new_data_flag, paused_flag,
     try:
         ser = serial.Serial(port, baudrate, timeout=1)
         ser.reset_input_buffer()
+    except serial.SerialException as e:
+        error_queue.put(str(e))
+        stop_event.set()
+        return
+
+    ready_event.set()
+
+    while not stop_event.is_set():
+        if paused_flag.value:
+            ser.reset_input_buffer()
+            time.sleep(0.05)
+            continue
+        try:
+            if ser.in_waiting > 0:
+                raw_data = ser.readline()
+                decoded_data = raw_data.decode('utf-8').strip()
+                split_data = decoded_data.split(' ')
+                if len(split_data) == 8:
+                    values = [int(v) for v in split_data]
+                    with shared_values.get_lock():
+                        shared_values[:] = values
+                        new_data_flag.value = 1
     except serial.SerialException as e:
         error_queue.put(str(e))
         stop_event.set()
