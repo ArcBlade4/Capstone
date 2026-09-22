@@ -6,9 +6,10 @@ from pynput import keyboard
 
 BAUDRATE = 115200
 
-INTERVAL_MS = 50         
-INTERVAL_S = INTERVAL_MS
-FLUSH_EVERY_N_ROWS = 100     
+INTERVAL_MS = 50                 
+INTERVAL_S = INTERVAL_MS / 1000.0
+FLUSH_EVERY_N_ROWS = 100        
+SPIN_MARGIN_S = 0.0005          
 
 HEADERS = ['Time', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'V7', 'V8']
 
@@ -41,7 +42,7 @@ def serial_reader(port, baudrate, shared_values, new_data_flag, paused_flag,
                         shared_values[:] = values
                         new_data_flag.value = 1
             else:
-                time.sleep(0)
+                time.sleep(0)  # yield without adding real delay
         except UnicodeDecodeError:
             print("Received data could not be decoded.")
         except ValueError:
@@ -68,9 +69,12 @@ def writer_loop(file_path, shared_values, new_data_flag, paused_flag, stop_event
         rows_since_flush = 0
 
         while not stop_event.is_set():
-            while time.perf_counter() < next_time:
-                time.sleep((INTERVAL_S/1000)-10)
-                pass 
+            remaining = next_time - time.perf_counter()
+            if remaining > 0:
+                if remaining > SPIN_MARGIN_S:
+                    time.sleep(remaining - SPIN_MARGIN_S)
+                while time.perf_counter() < next_time:
+                    pass  # short busy-spin closes the gap left by sleep()
 
             if not paused_flag.value and new_data_flag.value:
                 with shared_values.get_lock():
