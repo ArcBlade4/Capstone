@@ -113,9 +113,7 @@ def writer_loop(file_path, shared_values, new_data_flag, paused_flag, stop_event
         elapsed: float - seconds since start, net of paused time
         """
         paused, pause_started_at, total_paused = pause_state
-        elapsed = time.perf_counter() - start_time - total_paused.value
-        if paused.value and pause_started_at.value != 0.0:
-            elapsed -= (time.perf_counter() - pause_started_at.value)
+        elapsed = time.perf_counter() - start_time
         return elapsed
 
     with open(file_path, 'w', newline='') as f:
