@@ -3,7 +3,7 @@ import time
 import multiprocessing as mp
 import csv
 from pynput import keyboard
-
+import vis as v
 BAUDRATE = 115200
 
 INTERVAL_MS = 50
@@ -113,9 +113,15 @@ def writer_loop(file_path, shared_values, new_data_flag, paused_flag, stop_event
         elapsed: float - seconds since start, net of paused time
         """
         paused, pause_started_at, total_paused = pause_state
-        elapsed = time.perf_counter() - start_time
+        elapsed = time.perf_counter() - start_time - total_paused.value
+        if paused.value and pause_started_at.value != 0.0:
+            elapsed -= (time.perf_counter() - pause_started_at.value)
         return elapsed
 
+
+
+
+        
     with open(file_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(HEADERS)
@@ -124,6 +130,7 @@ def writer_loop(file_path, shared_values, new_data_flag, paused_flag, stop_event
         rows_since_flush = 0
 
         while not stop_event.is_set():
+            
             remaining = next_time - time.perf_counter()
             if remaining > 0:
                 if remaining > SPIN_MARGIN_S:
@@ -135,6 +142,9 @@ def writer_loop(file_path, shared_values, new_data_flag, paused_flag, stop_event
                 with shared_values.get_lock():
                     values = list(shared_values)
                     new_data_flag.value = 0  # mark this sample as consumed
+                print(values)
+                v.animate(values)
+
                 t_ms = round(time_since_start() * 1000, 0)
                 writer.writerow([t_ms] + values)
                 rows_since_flush += 1
