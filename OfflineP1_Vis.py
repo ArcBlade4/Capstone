@@ -18,7 +18,7 @@ plt.figure(figsize=(14, 6))
 for channel in emg_channels:
     plt.plot(time_axis, df[channel], label=channel, alpha=0.7, linewidth=1)
 
-plt.title('EMG Raw Signals (Position 1)', fontsize=14, fontweight='bold')
+plt.title('sEMG Raw Signals (Position 1)', fontsize=14, fontweight='bold')
 plt.xlabel('Time (Miliseconds)', fontsize=12)
 plt.ylabel('TBD', fontsize=12)
 plt.grid(True, linestyle='--', alpha=0.5)
