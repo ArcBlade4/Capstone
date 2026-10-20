@@ -214,6 +214,7 @@ class StreamingPreprocessor:
 if __name__ == "__main__":
     # Command-line use (the GUI imports this module and does not run this block)
     df = load_data('01.csv')
+    print(df)
     df = preprocess_pipeline(df, fs=200, lowcut=1, highcut=9)
     print(df.head())
     df.to_csv('preprocessed_data.csv', index=False)
