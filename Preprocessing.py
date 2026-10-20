@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from scipy.signal import iirnotch, butter, lfilter, sosfilt
+from scipy.signal import iirnotch, butter, lfilter, sosfilt, sosfilt_zi, tf2sos
 from sklearn.preprocessing import StandardScaler
 
 
@@ -120,6 +120,95 @@ def preprocess_pipeline(data, fs, lowcut, highcut, notch_freq=50.0):
         data.insert(0, 'Time', time)
 
     return data
+
+
+# Live / streaming version of the pipeline
+class StreamingPreprocessor:
+    """
+    Real-time counterpart of preprocess_pipeline. Feed it samples as they
+    arrive (any chunk size) and it returns the preprocessed samples.
+
+    Differences from the offline pipeline (a live stream has no "whole file"):
+      * notch + bandpass are the same filters, but their state is carried
+        between calls, and started from the first sample to avoid a transient
+      * zero-centring is dropped (the bandpass removes DC anyway)
+      * outliers are clipped to +/- clip_sigma instead of removed, so the
+        stream keeps its timing
+      * scaling uses running statistics (cumulative at first, then an
+        exponential moving average over ~stats_window_s seconds)
+      * the first warmup_s seconds are output as 0 while the statistics settle
+
+    Takes:
+    fs: float - sampling rate in Hz
+    lowcut, highcut: float - bandpass edges in Hz
+    notch_freq: float - mains frequency; skipped if at/above Nyquist (or 0)
+    n_channels: int - number of signal channels
+
+    process(samples) takes an array of shape (n, n_channels) and returns the
+    same shape. reset() clears all state (call it after a gap in the data).
+    """
+
+    def __init__(self, fs, lowcut, highcut, notch_freq=50.0, n_channels=8,
+                 order=5, quality_factor=30.0, stats_window_s=10.0,
+                 warmup_s=2.0, clip_sigma=3.0):
+        nyq = fs / 2
+        if not (0 < lowcut < highcut < nyq):
+            raise ValueError(
+                f"Bandpass needs 0 < lowcut < highcut < Nyquist ({nyq:g} Hz); "
+                f"got {lowcut:g}-{highcut:g} Hz at fs={fs:g} Hz."
+            )
+
+        sections = []
+        self.notch_active = bool(notch_freq) and 0 < notch_freq < nyq
+        if self.notch_active:
+            b, a = iirnotch(notch_freq, quality_factor, fs)
+            sections.append(tf2sos(b, a))
+        sections.append(butter(order, [lowcut / nyq, highcut / nyq],
+                               btype='band', output='sos'))
+        self.sos = np.vstack(sections)
+        self._zi_unit = sosfilt_zi(self.sos)   # state for a unit step input
+
+        self.n_channels = n_channels
+        self.alpha = 1.0 - np.exp(-1.0 / (stats_window_s * fs))
+        self.warmup = int(warmup_s * fs)
+        self.clip_sigma = clip_sigma
+        self.reset()
+
+    def reset(self):
+        self.zi = None
+        self.count = 0
+        self.mean = np.zeros(self.n_channels)
+        self.var = np.zeros(self.n_channels)
+
+    def process(self, samples):
+        x = np.atleast_2d(np.asarray(samples, dtype=float))
+        if x.shape[1] != self.n_channels:
+            raise ValueError(f"Expected {self.n_channels} channels, got {x.shape[1]}.")
+        if len(x) == 0:
+            return x
+
+        if self.zi is None:
+            # start the filters as if the signal had always been at its first value
+            self.zi = self._zi_unit[:, :, None] * x[0][None, None, :]   # (sections, 2, channels)
+        y, self.zi = sosfilt(self.sos, x, axis=0, zi=self.zi)
+
+        out = np.zeros_like(y)
+        for k in range(len(y)):
+            self.count += 1
+            a = max(1.0 / self.count, self.alpha)
+
+            if self.count > self.warmup:
+                std = np.maximum(np.sqrt(self.var), 1e-8)
+                z = np.clip((y[k] - self.mean) / std, -self.clip_sigma, self.clip_sigma)
+                out[k] = z
+                v = self.mean + z * std        # clipped value feeds the statistics
+            else:
+                v = y[k]
+
+            d = v - self.mean
+            self.mean = self.mean + a * d
+            self.var = (1.0 - a) * (self.var + a * d * d)
+        return out
 
 
 if __name__ == "__main__":
