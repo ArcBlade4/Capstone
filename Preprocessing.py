@@ -2,7 +2,16 @@ import numpy as np
 import pandas as pd
 from scipy.signal import iirnotch, butter, lfilter, sosfilt, sosfilt_zi, tf2sos
 from sklearn.preprocessing import StandardScaler
+import os
+import pickle
 
+# Windowing settings (adjust to your data)
+SAMPLE_RATE = 40 
+WINDOW_MS = 300                                 
+WINDOW_SIZE = SAMPLE_RATE * WINDOW_MS // 1000  
+STEP = 4                  
+GESTURES = {"fist": 1, "flexion": 2, "extension": 3, "radial": 4, "ulnar": 5, "rest": 6, "table": 7}
+GESTURE_NAMES = list(GESTURES.values())   
 
 # File loading
 def load_data(file_path):
@@ -86,18 +95,67 @@ def bandpass_filter(data, lowcut, highcut, fs, order=5):
 
 
 # Scaling
-def scale_data(data):
-    """Standardise each channel (zero mean, unit variance)."""
-    scaled_data = StandardScaler().fit_transform(data)
-    return pd.DataFrame(scaled_data, columns=data.columns)
+def scale_data(data, scaler=None):
+    """
+    Standardise each channel (zero mean, unit variance).
+    Fits a new StandardScaler unless one is given. Returns (scaled_df, scaler).
+    """
+    values = data.to_numpy(dtype=float)
+    if scaler is None:
+        scaler = StandardScaler().fit(values)
+    return pd.DataFrame(scaler.transform(values), columns=data.columns), scaler
+ 
+ 
+# Scaler file (pickle) shared between the offline pipeline and the live preprocessor
+def save_scaler_if_missing(path, scaler, settings):
+    """
+    Pickle {"scaler": scaler, "settings": settings} to path, but only if the file
+    does not exist yet (an existing scaler is never overwritten).
+    Returns True if the file was written.
+    """
+    if os.path.exists(path):
+        return False
+    with open(path, 'wb') as f:
+        pickle.dump({"scaler": scaler, "settings": dict(settings)}, f)
+    return True
+ 
+ 
+def load_scaler(path):
+    """
+    Load a scaler pickle. Returns (scaler, settings_dict).
+    Raises ValueError with a readable message if it is missing or invalid.
+    Only load pickle files you created yourself.
+    """
+    if not path or not os.path.exists(path):
+        raise ValueError(f"Scaler file not found: {path or '(no path given)'}\n"
+                         "Run the offline preprocessing once to create it.")
+    try:
+        with open(path, 'rb') as f:
+            obj = pickle.load(f)
+    except Exception as e:
+        raise ValueError(f"Could not read scaler file: {e}")
+    if isinstance(obj, dict) and "scaler" in obj:
+        scaler, settings = obj["scaler"], obj.get("settings", {})
+    else:
+        scaler, settings = obj, {}      # a bare pickled StandardScaler also works
+    if not (hasattr(scaler, "mean_") and hasattr(scaler, "scale_")):
+        raise ValueError("That pickle does not contain a fitted StandardScaler.")
+    return scaler, settings
+
+
 
 
 # Pipeline
-def preprocess_pipeline(data, fs, lowcut, highcut, notch_freq=50.0):
+def preprocess_pipeline(data, fs, lowcut, highcut, notch_freq=50.0, window=False):
     """
-    zero-centre -> notch -> bandpass -> outlier removal -> scaling.
+    zero-centre -> notch -> bandpass -> outlier removal -> scaling
+    (-> windowing, if window=True).
     Time / Gesture columns are split off first and re-attached at the end
     (only if they were present in the input).
+
+    Returns the preprocessed DataFrame. With window=True it returns
+    (df, windows, window_labels, starts) instead, and the input must
+    contain a 'Gesture' column.
     """
     data, time, target = split_time_target(data)
 
@@ -112,14 +170,57 @@ def preprocess_pipeline(data, fs, lowcut, highcut, notch_freq=50.0):
     if target is not None:
         target = target.reset_index(drop=True)
 
-    data = scale_data(data)
+    data, scaler = load_data(data)
+
+    # Windowing uses the scaled signal and its labels (before they are re-attached)
+    if window:
+        if target is None:
+            raise ValueError("window=True requires a 'Gesture' column in the input.")
+        windows, window_labels, starts = make_windows(data.to_numpy(), target.to_numpy())
 
     if target is not None:
         data.insert(len(data.columns), 'Gesture', target)
     if time is not None:
         data.insert(0, 'Time', time)
 
+    if window:
+        return data, windows, window_labels, starts
     return data
+
+
+# Windowing
+def make_windows(x, labels):
+    """Slide a window along the signal.
+
+    x       : signal, shape [samples, 8] (all recordings stored end to end)
+    labels  : gesture label of every sample, same length as x
+
+    Returns the windows, their labels, and each window's start position.
+    """
+    windows, window_labels, starts = [], [], []    # results are collected here
+
+    # Try a window at every STEP-th position. The last start is
+    # len(x) - WINDOW_SIZE, so the final window still fits inside the signal.
+    for start in range(0, len(x) - WINDOW_SIZE + 1, STEP):
+        end = start + WINDOW_SIZE                  # one past the window's last sample
+        chunk_labels = labels[start:end]           # the label of every sample in this window
+        gesture = chunk_labels[0]                  # the label the window starts with
+
+        # Rule 1: the window must start on a gesture we classify
+        if gesture not in GESTURES:                # skip pauses (0) and unused gestures
+            continue
+
+        # Rule 2: every sample must have that same label. This also drops
+        # windows that run from one file into the next, because neighbouring
+        # files hold different gestures.
+        if np.any(chunk_labels != gesture):        # skip windows that cross into another label
+            continue
+
+        # The window passed both rules: keep it
+        windows.append(x[start:end])               # the signal itself, shape [WINDOW_SIZE, 8]
+        window_labels.append(gesture)              # its gesture
+        starts.append(start)                       # where it begins, needed later for the time-based split
+    return windows, window_labels, starts
 
 
 # Live / streaming version of the pipeline
@@ -215,6 +316,8 @@ if __name__ == "__main__":
     # Command-line use (the GUI imports this module and does not run this block)
     df = load_data('01.csv')
     print(df)
-    df = preprocess_pipeline(df, fs=200, lowcut=1, highcut=9)
+    df, windows, window_labels, starts = preprocess_pipeline(
+        df, fs=200, lowcut=1, highcut=9, window=True)
     print(df.head())
+    print(f"{len(windows)} windows of shape {windows[0].shape}" if windows else "No windows found.")
     df.to_csv('preprocessed_data.csv', index=False)

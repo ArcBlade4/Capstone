@@ -2,8 +2,9 @@
 gui.py - EMG Data Studio
 
 One window that:
-  1. collects data from the serial port into a CSV (with pause / resume / stop)
-  2. preprocesses a CSV with Preprocessing.py
+  1. collects data from the serial port into a CSV (with pause / resume / stop).
+     The values saved to the CSV are the live-PREPROCESSED values.
+  2. preprocesses a (raw) CSV with Preprocessing.py
   3. shows a graph you can toggle: view (Live / Recorded raw / Preprocessed),
      individual channels V1-V8, and the whole graph on/off
 
@@ -15,7 +16,6 @@ import multiprocessing as mp
 import os
 import queue
 import threading
-import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -34,23 +34,33 @@ MAX_STATIC_POINTS = 20000    # downsample long recordings for plotting only
 LIVE_YLIM = (-50, 4500)
 NUM_CH = 8
 UI_POLL_MS = 40
-VIEWS = ("Live", "Recorded (raw)", "Preprocessed")
+LIVE_RAW = "Live (raw)"
+LIVE_PRE = "Live (preprocessed)"
+REC_RAW = "Recorded (raw)"
+PRE_FILE = "Preprocessed (file)"
+VIEWS = (LIVE_RAW, LIVE_PRE, REC_RAW, PRE_FILE)
+LIVE_VIEWS = (LIVE_RAW, LIVE_PRE)
+LIVE_PRE_YLIM = (-4, 4)
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("EMG Data Studio")
-        self.geometry("1300x780")
-        self.minsize(1000, 620)
+        self.geometry("1300x800")
+        self.minsize(1000, 640)
 
         self.sess = None             # dict of shared state while recording
         self.state = "idle"          # idle | connecting | recording
         self.rows_seen = 0
+        self.fs_used = None          # sampling rate used by the live preprocessor
         self.raw_df = None
         self.pre_df = None
         self._pp_result = None
         self.live_buffers = [
+            collections.deque([0.0] * WINDOW_SIZE, maxlen=WINDOW_SIZE) for _ in range(NUM_CH)
+        ]
+        self.live_pre_buffers = [
             collections.deque([0.0] * WINDOW_SIZE, maxlen=WINDOW_SIZE) for _ in range(NUM_CH)
         ]
 
@@ -103,23 +113,24 @@ class App(tk.Tk):
         self.rec_status = ttk.Label(box, text="Idle", wraplength=300, foreground="#555")
         self.rec_status.grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
-        # ---- 2. Preprocess
+        # ---- 2. Preprocess (settings used for BOTH live recording and the offline button)
         pbox = ttk.LabelFrame(side, text="2. Preprocess", padding=8)
         pbox.pack(fill="x", pady=(0, 8))
         pbox.columnconfigure(1, weight=1)
 
         self.pp_in_var = tk.StringVar()
         self.auto_fs = tk.BooleanVar(value=True)
-        self.fs_var = tk.StringVar(value="20")
+        self.fs_var = tk.StringVar(value="38")
         self.low_var = tk.StringVar(value="1")
         self.high_var = tk.StringVar(value="9")
-        self.notch_var = tk.StringVar(value="50")
+        self.notch_var = tk.StringVar(value="0")
+        self.env_var = tk.StringVar(value="4")
 
         ttk.Label(pbox, text="Input CSV").grid(row=0, column=0, sticky="w", pady=2)
         ttk.Entry(pbox, textvariable=self.pp_in_var, width=22).grid(row=0, column=1, sticky="ew", pady=2)
         ttk.Button(pbox, text="Browse", width=8, command=self.browse_pp_in).grid(row=0, column=2, padx=(4, 0))
 
-        ttk.Checkbutton(pbox, text="Sampling rate from Time column", variable=self.auto_fs,
+        ttk.Checkbutton(pbox, text="Measure sampling rate automatically", variable=self.auto_fs,
                         command=self._sync_fs_entry).grid(row=1, column=0, columnspan=3, sticky="w")
         ttk.Label(pbox, text="fs (Hz)").grid(row=2, column=0, sticky="w", pady=2)
         self.fs_entry = ttk.Entry(pbox, textvariable=self.fs_var, width=10)
@@ -128,13 +139,15 @@ class App(tk.Tk):
         ttk.Entry(pbox, textvariable=self.low_var, width=10).grid(row=3, column=1, sticky="w", pady=2)
         ttk.Label(pbox, text="High cut (Hz)").grid(row=4, column=0, sticky="w", pady=2)
         ttk.Entry(pbox, textvariable=self.high_var, width=10).grid(row=4, column=1, sticky="w", pady=2)
-        ttk.Label(pbox, text="Notch (Hz)").grid(row=5, column=0, sticky="w", pady=2)
+        ttk.Label(pbox, text="Notch (Hz, 0=off)").grid(row=5, column=0, sticky="w", pady=2)
         ttk.Entry(pbox, textvariable=self.notch_var, width=10).grid(row=5, column=1, sticky="w", pady=2)
+        ttk.Label(pbox, text="Envelope (Hz, 0=off)").grid(row=6, column=0, sticky="w", pady=2)
+        ttk.Entry(pbox, textvariable=self.env_var, width=10).grid(row=6, column=1, sticky="w", pady=2)
 
-        self.pp_btn = ttk.Button(pbox, text="Run preprocessing", command=self.run_preprocess)
-        self.pp_btn.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 2))
+        self.pp_btn = ttk.Button(pbox, text="Run preprocessing on file", command=self.run_preprocess)
+        self.pp_btn.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 2))
         self.pp_status = ttk.Label(pbox, text="", wraplength=300, foreground="#555")
-        self.pp_status.grid(row=7, column=0, columnspan=3, sticky="w")
+        self.pp_status.grid(row=8, column=0, columnspan=3, sticky="w")
         self._sync_fs_entry()
 
         # ---- 3. Graph controls
@@ -214,7 +227,32 @@ class App(tk.Tk):
             v.set(value)
         self.update_visibility()
 
+    def _read_pp_settings(self):
+        """Parse the step-2 fields -> (fs or None, low, high, notch, envelope or None)."""
+        try:
+            low = float(self.low_var.get())
+            high = float(self.high_var.get())
+            notch = float(self.notch_var.get())
+            env = float(self.env_var.get())
+            fs = None if self.auto_fs.get() else float(self.fs_var.get())
+        except ValueError:
+            raise ValueError("fs, cutoffs, notch and envelope must be numbers.")
+        return fs, low, high, notch, (env if env > 0 else None)
+
     # ------------------------------------------------------------ recording
+    def _live_pp_params(self):
+        """Parse + validate the settings for the recording process."""
+        fs, low, high, notch, env = self._read_pp_settings()
+        if fs is not None:   # with auto fs the rate isn't known until recording has started
+            pp.StreamingPreprocessor(fs, low, high, notch, n_channels=NUM_CH,
+                                     envelope_hz=env)   # raises ValueError if invalid
+        return (fs, low, high, notch, env)
+
+    def _rec_text(self, label):
+        if self.fs_used:
+            return f"{label} - {self.rows_seen} samples (fs {self.fs_used:.1f} Hz)"
+        return f"{label} - {self.rows_seen} samples (measuring sampling rate...)"
+
     def start_recording(self):
         port = self.port_var.get().strip()
         path = self.out_var.get().strip()
@@ -233,31 +271,33 @@ class App(tk.Tk):
                 "Overwrite?", f"{os.path.basename(path)} already exists. Overwrite it?"):
             return
 
+        try:
+            pp_params = self._live_pp_params()
+        except ValueError as e:
+            messagebox.showerror("Preprocessing settings", str(e))
+            return
+
         s = dict(
             path=path,
             paused=mp.Value('b', 0),
-            pause_started_at=mp.Value('d', 0.0),
-            total_paused=mp.Value('d', 0.0),
-            shared=mp.Array('i', 8),
-            new_flag=mp.Value('b', 0),
             stop=mp.Event(),
             ready=mp.Event(),
             errors=mp.Queue(),
             plot_q=mp.Queue(maxsize=5000),
-            reader=None,
-            writer=None,
+            proc=None,
         )
-        s['reader'] = mp.Process(
-            target=collector.serial_reader,
-            args=(port, baud, s['shared'], s['new_flag'], s['paused'],
-                  s['stop'], s['ready'], s['errors']),
+        s['proc'] = mp.Process(
+            target=collector.recorder,
+            args=(port, baud, path, pp_params, s['paused'], s['stop'], s['ready'],
+                  s['errors'], s['plot_q']),
             daemon=True,
         )
-        s['reader'].start()
+        s['proc'].start()
 
         self.sess = s
         self.state = "connecting"
         self.rows_seen = 0
+        self.fs_used = pp_params[0]          # None until measured in auto mode
         self.rec_status.config(text=f"Connecting to {port}...")
         self._set_buttons()
         self.after(50, self._poll_connect, s)
@@ -266,21 +306,12 @@ class App(tk.Tk):
         if self.sess is not s:
             return
         if s['ready'].is_set():
-            start_time = time.perf_counter()
-            s['writer'] = mp.Process(
-                target=collector.writer_loop,
-                args=(s['path'], s['shared'], s['new_flag'], s['paused'], s['stop'],
-                      start_time, (s['paused'], s['pause_started_at'], s['total_paused']),
-                      s['plot_q']),
-                daemon=True,
-            )
-            s['writer'].start()
-
-            for buf in self.live_buffers:
+            for buf in self.live_buffers + self.live_pre_buffers:
                 buf.extend([0.0] * WINDOW_SIZE)
             self.state = "recording"
             self.rec_status.config(text="Recording...")
-            self.view_var.set(VIEWS[0])
+            if self.view_var.get() not in LIVE_VIEWS:
+                self.view_var.set(LIVE_RAW)
             self.apply_view()
             self._set_buttons()
             self.after(UI_POLL_MS, self._poll_live, s)
@@ -297,18 +328,29 @@ class App(tk.Tk):
         if self.sess is not s:
             return
 
-        got = False
-        for _ in range(2000):
+        # the recorder process does the preprocessing; here we only display it
+        new_raw, new_pre = [], []
+        for _ in range(500):
             try:
-                _, values = s['plot_q'].get_nowait()
+                kind, payload = s['plot_q'].get_nowait()
             except queue.Empty:
                 break
+            if kind == "fs":
+                self.fs_used = payload
+            else:
+                for _t, raw, pre in payload:
+                    new_raw.append(raw)
+                    new_pre.append(pre)
+        got = bool(new_raw)
+        if got:
+            self.rows_seen += len(new_raw)
+            raw_arr = np.asarray(new_raw, dtype=float)
+            pre_arr = np.asarray(new_pre, dtype=float)
             for i in range(NUM_CH):
-                self.live_buffers[i].append(float(values[i]))
-            self.rows_seen += 1
-            got = True
+                self.live_buffers[i].extend(raw_arr[:, i])
+                self.live_pre_buffers[i].extend(pre_arr[:, i])
 
-        if s['stop'].is_set():  # reader hit a serial error
+        if s['stop'].is_set():  # recorder hit an error
             try:
                 msg = s['errors'].get(timeout=0.5)
             except queue.Empty:
@@ -317,27 +359,28 @@ class App(tk.Tk):
             return
 
         if got:
-            label = "PAUSED" if s['paused'].value else "Recording"
-            self.rec_status.config(text=f"{label} - {self.rows_seen} samples")
-            if self.view_var.get() == VIEWS[0] and self.show_graph.get():
-                for i, ln in enumerate(self.lines):
-                    ln.set_ydata(list(self.live_buffers[i]))
-                self.canvas.draw_idle()
+            self.rec_status.config(text=self._rec_text("PAUSED" if s['paused'].value else "Recording"))
+            if self.view_var.get() in LIVE_VIEWS and self.show_graph.get():
+                self._draw_live()
 
         self.after(UI_POLL_MS, self._poll_live, s)
+
+    def _draw_live(self):
+        bufs = self.live_pre_buffers if self.view_var.get() == LIVE_PRE else self.live_buffers
+        for i, ln in enumerate(self.lines):
+            ln.set_ydata(list(bufs[i]))
+        self.canvas.draw_idle()
 
     def toggle_pause(self):
         s = self.sess
         if not s or self.state != "recording":
             return
+        # the recorder handles the time bookkeeping and filter reset itself
         if not s['paused'].value:
             s['paused'].value = 1
-            s['pause_started_at'].value = time.perf_counter()
             self.pause_btn.config(text="Resume")
-            self.rec_status.config(text=f"PAUSED - {self.rows_seen} samples")
+            self.rec_status.config(text=self._rec_text("PAUSED"))
         else:
-            s['total_paused'].value += time.perf_counter() - s['pause_started_at'].value
-            s['pause_started_at'].value = 0.0
             s['paused'].value = 0
             self.pause_btn.config(text="Pause")
 
@@ -347,13 +390,11 @@ class App(tk.Tk):
             return
         self.sess = None          # ends the polling loops
         s['stop'].set()
-        wrote_file = s['writer'] is not None
-        for key in ("writer", "reader"):
-            p = s[key]
-            if p is not None:
-                p.join(timeout=2)
-                if p.is_alive():
-                    p.terminate()
+        was_started = s['ready'].is_set()
+        p = s['proc']
+        p.join(timeout=3)
+        if p.is_alive():
+            p.terminate()
 
         self.state = "idle"
         self.pause_btn.config(text="Pause")
@@ -361,15 +402,15 @@ class App(tk.Tk):
 
         if error:
             self.rec_status.config(text=f"Error: {error}")
-            messagebox.showerror("Serial error", error)
+            messagebox.showerror("Recording error", error)
 
-        if wrote_file and os.path.exists(s['path']):
+        if was_started and os.path.exists(s['path']):
             df = pp.load_data(s['path'])
             if df is not None and len(df):
-                self.raw_df = df
-                self.pp_in_var.set(s['path'])
-                self.rec_status.config(text=f"Saved {len(df)} rows to {s['path']}")
-                self.view_var.set(VIEWS[1])
+                # the saved file is already preprocessed
+                self.pre_df = df
+                self.rec_status.config(text=f"Saved {len(df)} preprocessed rows to {s['path']}")
+                self.view_var.set(PRE_FILE)
                 self.apply_view()
                 return
         if not error:
@@ -382,22 +423,19 @@ class App(tk.Tk):
             messagebox.showerror("No input", "Choose an existing CSV to preprocess.")
             return
         try:
-            low = float(self.low_var.get())
-            high = float(self.high_var.get())
-            notch = float(self.notch_var.get())
-            fs = None if self.auto_fs.get() else float(self.fs_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid value", "fs, cutoffs and notch must be numbers.")
+            fs, low, high, notch, env = self._read_pp_settings()
+        except ValueError as e:
+            messagebox.showerror("Invalid value", str(e))
             return
 
         self.pp_btn.config(state="disabled")
         self.pp_status.config(text="Working...")
         self._pp_result = None
-        threading.Thread(target=self._pp_worker, args=(in_path, fs, low, high, notch),
+        threading.Thread(target=self._pp_worker, args=(in_path, fs, low, high, notch, env),
                          daemon=True).start()
         self.after(100, self._poll_pp)
 
-    def _pp_worker(self, in_path, fs, low, high, notch):
+    def _pp_worker(self, in_path, fs, low, high, notch, env):
         try:
             raw = pp.load_data(in_path)
             if raw is None or raw.empty:
@@ -405,11 +443,12 @@ class App(tk.Tk):
             if fs is None:
                 if 'Time' not in raw.columns:
                     raise ValueError("No 'Time' column - untick the auto option and enter fs.")
-                dt = np.median(np.diff(raw['Time'].to_numpy(dtype=float)))
-                if not dt > 0:
+                t = raw['Time'].to_numpy(dtype=float)
+                span = t[-1] - t[0]
+                if len(t) < 2 or not span > 0:
                     raise ValueError("Could not estimate fs from the Time column.")
-                fs = 1000.0 / dt   # recorder writes Time in milliseconds
-            out = pp.preprocess_pipeline(raw, fs, low, high, notch)
+                fs = 1000.0 * (len(t) - 1) / span   # Time is in ms; mean rate over the whole file
+            out = pp.preprocess_pipeline(raw, fs, low, high, notch, envelope_hz=env)
             out_path = os.path.splitext(in_path)[0] + "_preprocessed.csv"
             out.to_csv(out_path, index=False)
             self._pp_result = ("ok", raw, out, fs, out_path)
@@ -429,7 +468,7 @@ class App(tk.Tk):
         _, raw, out, fs, out_path = res
         self.raw_df, self.pre_df = raw, out
         self.pp_status.config(text=f"Done (fs={fs:.2f} Hz). {len(out)} rows saved to {out_path}")
-        self.view_var.set(VIEWS[2])
+        self.view_var.set(PRE_FILE)
         self.apply_view()
 
     # ------------------------------------------------------------------ plot
@@ -437,18 +476,20 @@ class App(tk.Tk):
         mode = self.view_var.get()
         ax = self.ax
 
-        if mode == VIEWS[0]:
+        if mode in LIVE_VIEWS:
+            pre = mode == LIVE_PRE
+            bufs = self.live_pre_buffers if pre else self.live_buffers
             x = np.arange(WINDOW_SIZE)
             for i, ln in enumerate(self.lines):
-                ln.set_data(x, list(self.live_buffers[i]))
+                ln.set_data(x, list(bufs[i]))
                 ln.set_label(f"V{i+1}")
             ax.set_xlim(0, WINDOW_SIZE - 1)
-            ax.set_ylim(*LIVE_YLIM)
+            ax.set_ylim(*(LIVE_PRE_YLIM if pre else LIVE_YLIM))
             ax.set_xlabel("Latest samples")
-            ax.set_ylabel("ADC value")
-            ax.set_title("Live EMG")
+            ax.set_ylabel("Standardised value (clipped to +/-3)" if pre else "ADC value")
+            ax.set_title("Live EMG (preprocessed)" if pre else "Live EMG (raw)")
         else:
-            df = self.raw_df if mode == VIEWS[1] else self.pre_df
+            df = self.raw_df if mode == REC_RAW else self.pre_df
             cols = []
             if df is not None and len(df):
                 cols = [c for c in df.columns if c not in ("Time", "Gesture")][:NUM_CH]
@@ -462,12 +503,12 @@ class App(tk.Tk):
                 else:
                     ln.set_data([], [])
             ax.set_xlabel("Time (ms)")
-            if mode == VIEWS[1]:
+            if mode == REC_RAW:
                 ax.set_ylabel("ADC value")
                 ax.set_title("Recorded (raw)" if cols else "Recorded (raw) - nothing loaded yet")
             else:
                 ax.set_ylabel("Standardised value (z-score)")
-                ax.set_title("Preprocessed" if cols else "Preprocessed - run step 2 first")
+                ax.set_title("Preprocessed" if cols else "Preprocessed - nothing loaded yet")
 
         self.update_visibility()
 
@@ -485,7 +526,10 @@ class App(tk.Tk):
             if leg:
                 leg.remove()
 
-        if self.view_var.get() != VIEWS[0]:
+        if self.view_var.get() not in LIVE_VIEWS:
+            # set_xlim/set_ylim (used by the Live view) switch autoscaling off,
+            # so it has to be turned back on before rescaling to the data
+            self.ax.set_autoscale_on(True)
             self.ax.relim(visible_only=True)
             self.ax.autoscale_view()
         self.canvas.draw_idle()

@@ -1,141 +1,172 @@
 """
-collector.py - serial acquisition + CSV writing (refactored from main.py).
+collector.py - serial acquisition, live preprocessing and CSV writing.
 
-The two worker functions are meant to be run as separate processes by the GUI:
-    serial_reader -> reads the serial port and keeps the latest sample in shared memory
-    writer_loop   -> every INTERVAL_S writes the latest sample to CSV and also pushes
-                     (time_ms, values) onto plot_queue so the GUI can draw it live
+`recorder` is meant to be run as a separate process by the GUI. It:
+  * reads every line the device sends (no 16 ms "latest value" sampling, so no dropped samples)
+  * timestamps each sample from when it arrived (samples that arrive together in one
+    serial chunk are spread evenly between the previous chunk and this one)
+  * runs every sample through the streaming preprocessor, writes the PREPROCESSED
+    values to the CSV, and sends (raw, preprocessed) rows to the GUI for the live graph
+
+If the sampling rate is not given, it is measured from the first CALIB_S seconds.
 """
 import csv
 import queue
 import time
 
+import numpy as np
 import serial
 
+import Preprocessing as pp
+
 BAUDRATE = 115200
-
-INTERVAL_MS = 50
-INTERVAL_S = INTERVAL_MS / 1000.0
-FLUSH_EVERY_N_ROWS = 5
-SPIN_MARGIN_S = 0.0005
-
 HEADERS = ['Time', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'V7', 'V8']
+N_CH = len(HEADERS) - 1
+CALIB_S = 2.0          # seconds of data used to measure the sampling rate (auto mode)
 
 
-def serial_reader(port, baudrate, shared_values, new_data_flag, paused_flag,
-                  stop_event, ready_event, error_queue):
+def recorder(port, baudrate, file_path, pp_params, paused_flag, stop_event,
+             ready_event, error_queue, plot_queue):
     """
-    Continuously reads lines from the serial port and stores the latest parsed
-    sample into shared memory for the writer process.
-
     Takes:
-    port: str - the COM port to read from
-    baudrate: int - serial baud rate
-    shared_values: mp.Array('i', 8) - shared array updated with the latest sample
-    new_data_flag: mp.Value('b') - set to 1 whenever a new sample is written
-    paused_flag: mp.Value('b') - when true, reading is skipped and the input buffer is drained
+    port, baudrate: serial settings
+    file_path: str - where the preprocessed CSV is saved
+    pp_params: tuple (fs, lowcut, highcut, notch_freq, envelope_hz)
+               fs=None -> measure it from the first CALIB_S seconds
+               notch_freq=0 -> no notch; envelope_hz=None -> no rectify/smooth stage
+    paused_flag: mp.Value('b') - while true, incoming data is discarded
     stop_event: mp.Event - signals the process to stop
-    ready_event: mp.Event - set once the serial port has been opened
-    error_queue: mp.Queue - used to pass a serial error message back to the GUI
-
-    Malformed lines (wrong token count / non-integer values) are silently skipped.
+    ready_event: mp.Event - set once the port and file are open
+    error_queue: mp.Queue - a serial / settings error message for the GUI
+    plot_queue: mp.Queue - receives ("rows", [(t_ms, raw[8], pre[8]), ...]) and
+                ("fs", sampling_rate_hz); dropped silently if the GUI falls behind
     """
+    fs_fixed, low, high, notch, env = pp_params
+
+    def make_proc(fs):
+        return pp.StreamingPreprocessor(fs, low, high, notch, n_channels=N_CH,
+                                        envelope_hz=env)
+
+    proc = None
+    if fs_fixed:
+        try:
+            proc = make_proc(fs_fixed)
+        except ValueError as e:
+            error_queue.put(str(e))
+            stop_event.set()
+            return
+
     try:
-        ser = serial.Serial(port, baudrate, timeout=1)
+        ser = serial.Serial(port, baudrate, timeout=0.1)
         ser.reset_input_buffer()
     except serial.SerialException as e:
         error_queue.put(str(e))
         stop_event.set()
         return
 
-    ready_event.set()
-
-    try:
-        while not stop_event.is_set():
-            if paused_flag.value:
-                ser.reset_input_buffer()
-                time.sleep(0.05)
-                continue
-            try:
-                if ser.in_waiting > 0:
-                    raw_data = ser.readline()
-                    decoded = raw_data.decode('utf-8', errors='ignore').strip()
-                    tokens = decoded.replace(',', ' ').split()
-                    if len(tokens) == 8:
-                        values = [int(t) for t in tokens]
-                        with shared_values.get_lock():
-                            shared_values[:] = values
-                            new_data_flag.value = 1
-                else:
-                    time.sleep(0)  # yield without adding real delay
-            except serial.SerialException as e:
-                error_queue.put(str(e))
-                stop_event.set()
-                return
-            except ValueError:
-                pass  # malformed sample, skip it
-    finally:
-        ser.close()
-
-
-def writer_loop(file_path, shared_values, new_data_flag, paused_flag, stop_event,
-                start_time, pause_state, plot_queue):
-    """
-    Runs on a fixed INTERVAL_S tick. Whenever unpaused and a new sample is
-    available, writes one row (elapsed ms + latest values) to the CSV and
-    pushes the same row to plot_queue for the live graph.
-
-    Takes:
-    file_path: str - where the CSV is saved
-    shared_values / new_data_flag / paused_flag / stop_event: shared state (see serial_reader)
-    start_time: float - time.perf_counter() captured when recording began
-    pause_state: tuple(mp.Value, mp.Value, mp.Value) - (paused, pause_started_at, total_paused)
-    plot_queue: mp.Queue - receives (t_ms, [8 ints]); dropped silently if the GUI falls behind
-    """
-
-    def time_since_start():
-        """Seconds since start, net of any time spent paused."""
-        paused, pause_started_at, total_paused = pause_state
-        elapsed = time.perf_counter() - start_time - total_paused.value
-        if paused.value and pause_started_at.value != 0.0:
-            elapsed -= (time.perf_counter() - pause_started_at.value)
-        return elapsed
+    def send(item):
+        try:
+            plot_queue.put_nowait(item)
+        except queue.Full:
+            pass
 
     try:
         with open(file_path, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(HEADERS)
+            f.flush()
 
-            next_time = time.perf_counter()
-            rows_since_flush = 0
+            ready_event.set()
+            t0 = time.perf_counter()
+            total_paused = 0.0
+            pause_started = None
+            last_t = 0.0
+            buf = b''
+            calib_ts, calib_vals = [], []
+
+            def now_t():
+                return time.perf_counter() - t0 - total_paused
+
+            def write_rows(ts, pre):
+                for t, p in zip(ts, pre):
+                    writer.writerow([int(round(t * 1000))] + [f"{v:.5f}" for v in p])
+                f.flush()
 
             while not stop_event.is_set():
-                remaining = next_time - time.perf_counter()
-                if remaining > 0:
-                    if remaining > SPIN_MARGIN_S:
-                        time.sleep(remaining - SPIN_MARGIN_S)
-                    while time.perf_counter() < next_time:
-                        pass  # short busy-spin closes the gap left by sleep()
+                try:
+                    if paused_flag.value:
+                        if pause_started is None:
+                            pause_started = time.perf_counter()
+                        ser.reset_input_buffer()
+                        buf = b''
+                        time.sleep(0.05)
+                        continue
+                    if pause_started is not None:           # just resumed
+                        total_paused += time.perf_counter() - pause_started
+                        pause_started = None
+                        buf = b''
+                        last_t = now_t()
+                        calib_ts.clear()
+                        calib_vals.clear()
+                        if proc is not None:
+                            proc.reset()                    # gap in the data
 
-                if not paused_flag.value and new_data_flag.value:
-                    with shared_values.get_lock():
-                        values = list(shared_values)
-                        new_data_flag.value = 0  # mark this sample as consumed
+                    first = ser.read(1)                     # blocks until data (or 0.1 s timeout)
+                    if not first:
+                        continue
+                    data = buf + first + ser.read(ser.in_waiting)
+                except serial.SerialException as e:
+                    error_queue.put(str(e))
+                    stop_event.set()
+                    return
 
-                    t_ms = int(round(time_since_start() * 1000))
-                    writer.writerow([t_ms] + values)
+                lines = data.split(b'\n')
+                buf = lines.pop()                           # incomplete last line
+                if len(buf) > 4096:
+                    buf = b''
+                vals = []
+                for ln in lines:
+                    tokens = ln.decode('utf-8', errors='ignore').replace(',', ' ').split()
+                    if len(tokens) == 8:
+                        try:
+                            vals.append([int(t) for t in tokens])
+                        except ValueError:
+                            pass                            # malformed sample
+                if not vals:
+                    continue
 
-                    try:
-                        plot_queue.put_nowait((t_ms, values))
-                    except queue.Full:
-                        pass
+                # spread samples that arrived together evenly since the last chunk
+                now = now_t()
+                n = len(vals)
+                ts = [last_t + (now - last_t) * (k + 1) / n for k in range(n)]
+                last_t = now
 
-                    rows_since_flush += 1
-                    if rows_since_flush >= FLUSH_EVERY_N_ROWS:
-                        f.flush()
-                        rows_since_flush = 0
+                if proc is None:
+                    # still measuring the sampling rate: show raw only
+                    calib_ts += ts
+                    calib_vals += vals
+                    send(("rows", [(int(round(t * 1000)), v, [0.0] * N_CH)
+                                   for t, v in zip(ts, vals)]))
+                    span = calib_ts[-1] - calib_ts[0]
+                    if span >= CALIB_S and len(calib_ts) >= 10:
+                        fs_est = (len(calib_ts) - 1) / span
+                        try:
+                            proc = make_proc(fs_est)
+                        except ValueError as e:
+                            error_queue.put(str(e))
+                            stop_event.set()
+                            return
+                        pre = proc.process(np.asarray(calib_vals, dtype=float))
+                        write_rows(calib_ts, pre)
+                        send(("fs", fs_est))
+                        calib_ts, calib_vals = [], []
+                    continue
 
-                next_time += INTERVAL_S
+                pre = proc.process(np.asarray(vals, dtype=float))
+                write_rows(ts, pre)
+                send(("rows", [(int(round(t * 1000)), v, p.tolist())
+                               for t, v, p in zip(ts, vals, pre)]))
     finally:
+        ser.close()
         # don't let unread queue items block this process from exiting
         plot_queue.cancel_join_thread()
