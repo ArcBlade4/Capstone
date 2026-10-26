@@ -9,7 +9,7 @@ One window that:
      individual channels V1-V8, and the whole graph on/off
 
 Run:  python gui.py
-Needs: pyserial pandas numpy scipy scikit-learn matplotlib   (tkinter ships with Python)
+Needs: pyserial pandas numpy scipy matplotlib   (tkinter ships with Python)
 """
 import collections
 import multiprocessing as mp
@@ -35,12 +35,10 @@ LIVE_YLIM = (-50, 4500)
 NUM_CH = 8
 UI_POLL_MS = 40
 LIVE_RAW = "Live (raw)"
-LIVE_PRE = "Live (preprocessed)"
 REC_RAW = "Recorded (raw)"
 PRE_FILE = "Preprocessed (file)"
-VIEWS = (LIVE_RAW, LIVE_PRE, REC_RAW, PRE_FILE)
-LIVE_VIEWS = (LIVE_RAW, LIVE_PRE)
-LIVE_PRE_YLIM = (-4, 4)
+VIEWS = (LIVE_RAW, REC_RAW, PRE_FILE)
+LIVE_VIEWS = (LIVE_RAW,)
 
 
 class App(tk.Tk):
@@ -57,10 +55,8 @@ class App(tk.Tk):
         self.raw_df = None
         self.pre_df = None
         self._pp_result = None
+        self._pp_progress = ""
         self.live_buffers = [
-            collections.deque([0.0] * WINDOW_SIZE, maxlen=WINDOW_SIZE) for _ in range(NUM_CH)
-        ]
-        self.live_pre_buffers = [
             collections.deque([0.0] * WINDOW_SIZE, maxlen=WINDOW_SIZE) for _ in range(NUM_CH)
         ]
 
@@ -77,9 +73,13 @@ class App(tk.Tk):
         main = ttk.Frame(self, padding=(0, 8, 8, 8))
         main.pack(side="right", fill="both", expand=True)
 
-        # ---- 1. Collect
-        box = ttk.LabelFrame(side, text="1. Collect data", padding=8)
-        box.pack(fill="x", pady=(0, 8))
+        # ---- Record / Preprocess: one section, swapped with tabs
+        self.tabs = ttk.Notebook(side)
+        self.tabs.pack(fill="x", pady=(0, 8))
+
+        # ---- Record tab
+        box = ttk.Frame(self.tabs, padding=8)
+        self.tabs.add(box, text="Record data")
         box.columnconfigure(1, weight=1)
 
         self.port_var = tk.StringVar()
@@ -112,27 +112,30 @@ class App(tk.Tk):
 
         self.rec_status = ttk.Label(box, text="Idle", wraplength=300, foreground="#555")
         self.rec_status.grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
-        # ---- 2. Preprocess (settings used for BOTH live recording and the offline button)
-        pbox = ttk.LabelFrame(side, text="2. Preprocess", padding=8)
-        pbox.pack(fill="x", pady=(0, 8))
+    
+        # ---- Preprocess tab (settings used for BOTH live recording and the offline button)
+        pbox = ttk.Frame(self.tabs, padding=8)
+        self.tabs.add(pbox, text="Preprocess")
         pbox.columnconfigure(1, weight=1)
 
         self.pp_in_var = tk.StringVar()
-        self.auto_fs = tk.BooleanVar(value=True)
-        self.fs_var = tk.StringVar(value="38")
+        self.auto_fs = tk.BooleanVar(value=False)
+        self.fs_var = tk.StringVar(value=str(pp.SAMPLE_RATE))   # rate the model was trained at
         self.low_var = tk.StringVar(value="1")
-        self.high_var = tk.StringVar(value="9")
+        self.high_var = tk.StringVar(value="8")
         self.notch_var = tk.StringVar(value="0")
-        self.env_var = tk.StringVar(value="4")
+        self.scaler_var = tk.StringVar(value=os.path.join(os.getcwd(), "scaler.pkl"))
 
-        ttk.Label(pbox, text="Input CSV").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Label(pbox, text="Input").grid(row=0, column=0, sticky="w", pady=2)
         ttk.Entry(pbox, textvariable=self.pp_in_var, width=22).grid(row=0, column=1, sticky="ew", pady=2)
-        ttk.Button(pbox, text="Browse", width=8, command=self.browse_pp_in).grid(row=0, column=2, padx=(4, 0))
+        inb = ttk.Frame(pbox)
+        inb.grid(row=0, column=2, padx=(4, 0))
+        ttk.Button(inb, text="File", width=6, command=self.browse_pp_in).pack(side="left")
+        ttk.Button(inb, text="Folder", width=6, command=self.browse_pp_folder).pack(side="left", padx=(2, 0))
 
-        ttk.Checkbutton(pbox, text="Measure sampling rate automatically", variable=self.auto_fs,
+        ttk.Checkbutton(pbox, text="Measure sampling rate from file (offline only)", variable=self.auto_fs,
                         command=self._sync_fs_entry).grid(row=1, column=0, columnspan=3, sticky="w")
-        ttk.Label(pbox, text="fs (Hz)").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Label(pbox, text="fs (Hz, resample to)").grid(row=2, column=0, sticky="w", pady=2)
         self.fs_entry = ttk.Entry(pbox, textvariable=self.fs_var, width=10)
         self.fs_entry.grid(row=2, column=1, sticky="w", pady=2)
         ttk.Label(pbox, text="Low cut (Hz)").grid(row=3, column=0, sticky="w", pady=2)
@@ -141,17 +144,18 @@ class App(tk.Tk):
         ttk.Entry(pbox, textvariable=self.high_var, width=10).grid(row=4, column=1, sticky="w", pady=2)
         ttk.Label(pbox, text="Notch (Hz, 0=off)").grid(row=5, column=0, sticky="w", pady=2)
         ttk.Entry(pbox, textvariable=self.notch_var, width=10).grid(row=5, column=1, sticky="w", pady=2)
-        ttk.Label(pbox, text="Envelope (Hz, 0=off)").grid(row=6, column=0, sticky="w", pady=2)
-        ttk.Entry(pbox, textvariable=self.env_var, width=10).grid(row=6, column=1, sticky="w", pady=2)
+        ttk.Label(pbox, text="Scaler file").grid(row=6, column=0, sticky="w", pady=2)
+        ttk.Entry(pbox, textvariable=self.scaler_var, width=22).grid(row=6, column=1, sticky="ew", pady=2)
+        ttk.Button(pbox, text="Browse", width=8, command=self.browse_scaler).grid(row=6, column=2, padx=(4, 0))
 
-        self.pp_btn = ttk.Button(pbox, text="Run preprocessing on file", command=self.run_preprocess)
+        self.pp_btn = ttk.Button(pbox, text="Run preprocessing", command=self.run_preprocess)
         self.pp_btn.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 2))
         self.pp_status = ttk.Label(pbox, text="", wraplength=300, foreground="#555")
         self.pp_status.grid(row=8, column=0, columnspan=3, sticky="w")
         self._sync_fs_entry()
 
         # ---- 3. Graph controls
-        gbox = ttk.LabelFrame(side, text="3. Graph", padding=8)
+        gbox = ttk.LabelFrame(side, text="Graph", padding=8)
         gbox.pack(fill="x")
 
         self.view_var = tk.StringVar(value=VIEWS[0])
@@ -213,6 +217,34 @@ class App(tk.Tk):
         if p:
             self.pp_in_var.set(p)
 
+    def browse_pp_folder(self):
+        p = filedialog.askdirectory(title="Folder with the recordings (subfolders are included)")
+        if p:
+            self.pp_in_var.set(p)
+
+    @staticmethod
+    def _find_inputs(path):
+        """A file -> [file]; a folder -> every .csv/.txt inside it (subfolders too), sorted."""
+        if not os.path.isdir(path):
+            return [path]
+        found = []
+        for root, _dirs, files in os.walk(path):
+            for f in files:
+                low = f.lower()
+                if low.endswith((".csv", ".txt")) and not low.endswith("_preprocessed.csv"):
+                    found.append(os.path.join(root, f))
+        return sorted(found)
+
+    def _set_progress(self, msg):
+        self._pp_progress = msg
+
+    def browse_scaler(self):
+        p = filedialog.asksaveasfilename(defaultextension=".pkl", confirmoverwrite=False,
+                                         filetypes=[("Scaler pickle", "*.pkl"), ("All files", "*.*")],
+                                         initialfile=os.path.basename(self.scaler_var.get()))
+        if p:
+            self.scaler_var.set(p)
+
     def _set_buttons(self):
         idle = self.state == "idle"
         rec = self.state == "recording"
@@ -228,25 +260,46 @@ class App(tk.Tk):
         self.update_visibility()
 
     def _read_pp_settings(self):
-        """Parse the step-2 fields -> (fs or None, low, high, notch, envelope or None)."""
+        """Parse the Preprocess-tab fields -> (fs or None, low, high, notch, scaler_path)."""
         try:
             low = float(self.low_var.get())
             high = float(self.high_var.get())
             notch = float(self.notch_var.get())
-            env = float(self.env_var.get())
             fs = None if self.auto_fs.get() else float(self.fs_var.get())
         except ValueError:
-            raise ValueError("fs, cutoffs, notch and envelope must be numbers.")
-        return fs, low, high, notch, (env if env > 0 else None)
+            raise ValueError("fs, cutoffs and notch must be numbers.")
+        return fs, low, high, notch, self.scaler_var.get().strip()
+
+    @staticmethod
+    def _scaler_settings(fs, low, high, notch):
+        return {"fs": fs, "lowcut": low, "highcut": high, "notch": notch}
+
+    @staticmethod
+    def _settings_diff(saved, now):
+        """Names of the settings that differ between a scaler file and the current fields."""
+        diff = []
+        for k, v in now.items():
+            if k in saved and v is not None and saved[k] is not None and abs(float(saved[k]) - float(v)) > 0.5:
+                diff.append(f"{k}: file {saved[k]:g}, now {v:g}")
+        return diff
 
     # ------------------------------------------------------------ recording
     def _live_pp_params(self):
         """Parse + validate the settings for the recording process."""
-        fs, low, high, notch, env = self._read_pp_settings()
+        fs, low, high, notch, scaler_path = self._read_pp_settings()
+        scaler = None
+        if scaler_path and os.path.exists(scaler_path):
+            scaler, saved = pp.load_scaler(scaler_path)          # raises ValueError if unreadable
+            diff = self._settings_diff(saved, self._scaler_settings(fs, low, high, notch))
+            if diff:
+                raise ValueError("The scaler file was made with different settings:\n  "
+                                 + "\n  ".join(diff) + "\nChange the fields or choose another scaler file.")
+        else:
+            scaler_path = None                                   # start_recording asks what to do
         if fs is not None:   # with auto fs the rate isn't known until recording has started
-            pp.StreamingPreprocessor(fs, low, high, notch, n_channels=NUM_CH,
-                                     envelope_hz=env)   # raises ValueError if invalid
-        return (fs, low, high, notch, env)
+            pp.StreamingPreprocessor(fs, low, high, notch or None, n_channels=NUM_CH,
+                                     scaler=scaler)             # raises ValueError if invalid
+        return (fs, low, high, notch, scaler_path)
 
     def _rec_text(self, label):
         if self.fs_used:
@@ -275,6 +328,12 @@ class App(tk.Tk):
             pp_params = self._live_pp_params()
         except ValueError as e:
             messagebox.showerror("Preprocessing settings", str(e))
+            return
+        if pp_params[4] is None and not messagebox.askyesno(
+                "No scaler file",
+                "There is no scaler file yet, so the live values will be filtered but NOT standardised "
+                "(the saved CSV will not match the training scale).\n\n"
+                "Record anyway? (Run preprocessing on a recording first to create scaler.pkl.)"):
             return
 
         s = dict(
@@ -306,7 +365,7 @@ class App(tk.Tk):
         if self.sess is not s:
             return
         if s['ready'].is_set():
-            for buf in self.live_buffers + self.live_pre_buffers:
+            for buf in self.live_buffers:
                 buf.extend([0.0] * WINDOW_SIZE)
             self.state = "recording"
             self.rec_status.config(text="Recording...")
@@ -328,8 +387,8 @@ class App(tk.Tk):
         if self.sess is not s:
             return
 
-        # the recorder process does the preprocessing; here we only display it
-        new_raw, new_pre = [], []
+        # the recorder process does the preprocessing and saving; here we only display the raw signal
+        new_raw = []
         for _ in range(500):
             try:
                 kind, payload = s['plot_q'].get_nowait()
@@ -338,17 +397,14 @@ class App(tk.Tk):
             if kind == "fs":
                 self.fs_used = payload
             else:
-                for _t, raw, pre in payload:
+                for _t, raw, _pre in payload:
                     new_raw.append(raw)
-                    new_pre.append(pre)
         got = bool(new_raw)
         if got:
             self.rows_seen += len(new_raw)
             raw_arr = np.asarray(new_raw, dtype=float)
-            pre_arr = np.asarray(new_pre, dtype=float)
             for i in range(NUM_CH):
                 self.live_buffers[i].extend(raw_arr[:, i])
-                self.live_pre_buffers[i].extend(pre_arr[:, i])
 
         if s['stop'].is_set():  # recorder hit an error
             try:
@@ -366,9 +422,8 @@ class App(tk.Tk):
         self.after(UI_POLL_MS, self._poll_live, s)
 
     def _draw_live(self):
-        bufs = self.live_pre_buffers if self.view_var.get() == LIVE_PRE else self.live_buffers
         for i, ln in enumerate(self.lines):
-            ln.set_ydata(list(bufs[i]))
+            ln.set_ydata(list(self.live_buffers[i]))
         self.canvas.draw_idle()
 
     def toggle_pause(self):
@@ -420,43 +475,76 @@ class App(tk.Tk):
     def run_preprocess(self):
         in_path = self.pp_in_var.get().strip()
         if not in_path or not os.path.exists(in_path):
-            messagebox.showerror("No input", "Choose an existing CSV to preprocess.")
+            messagebox.showerror("No input", "Choose an existing CSV file or a folder to preprocess.")
             return
         try:
-            fs, low, high, notch, env = self._read_pp_settings()
+            fs, low, high, notch, scaler_path = self._read_pp_settings()
         except ValueError as e:
             messagebox.showerror("Invalid value", str(e))
             return
 
         self.pp_btn.config(state="disabled")
         self.pp_status.config(text="Working...")
+        self._pp_progress = ""
         self._pp_result = None
-        threading.Thread(target=self._pp_worker, args=(in_path, fs, low, high, notch, env),
+        threading.Thread(target=self._pp_worker, args=(in_path, fs, low, high, notch, scaler_path),
                          daemon=True).start()
         self.after(100, self._poll_pp)
 
-    def _pp_worker(self, in_path, fs, low, high, notch, env):
+    def _pp_worker(self, in_path, fs, low, high, notch, scaler_path):
         try:
-            raw = pp.load_data(in_path)
-            if raw is None or raw.empty:
-                raise ValueError("Could not read any data from that CSV.")
-            if fs is None:
-                if 'Time' not in raw.columns:
-                    raise ValueError("No 'Time' column - untick the auto option and enter fs.")
-                t = raw['Time'].to_numpy(dtype=float)
-                span = t[-1] - t[0]
-                if len(t) < 2 or not span > 0:
+            paths = self._find_inputs(in_path)
+            if not paths:
+                raise ValueError("No .csv or .txt files found in that folder.")
+
+            if fs is None:                       # pool the gaps of all files, median as PREPRO.estimate_rate
+                gaps = []
+                for p in paths:
+                    raw = pp.load_data(p)
+                    if raw is None or 'Time' not in raw.columns:
+                        raise ValueError(f"No 'Time' column in {os.path.basename(p)} - "
+                                         "untick the auto option and enter fs.")
+                    g = np.diff(raw['Time'].to_numpy(dtype=float))
+                    gaps.append(g[g > 0])
+                gaps = np.concatenate(gaps)
+                if len(gaps) == 0:
                     raise ValueError("Could not estimate fs from the Time column.")
-                fs = 1000.0 * (len(t) - 1) / span   # Time is in ms; mean rate over the whole file
-            out = pp.preprocess_pipeline(raw, fs, low, high, notch, envelope_hz=env)
-            out_path = os.path.splitext(in_path)[0] + "_preprocessed.csv"
-            out.to_csv(out_path, index=False)
-            self._pp_result = ("ok", raw, out, fs, out_path)
+                fs = 1000.0 / np.median(gaps)    # Time is in ms
+            now = self._scaler_settings(fs, low, high, notch)
+
+            # use the shared scaler if it exists (so offline and live agree), else fit and save one
+            scaler, note = None, ""
+            if scaler_path and os.path.exists(scaler_path):
+                scaler, saved = pp.load_scaler(scaler_path)
+                diff = self._settings_diff(saved, now)
+                if diff:
+                    raise ValueError("The scaler file was made with different settings:\n  "
+                                     + "\n  ".join(diff) + "\nChange the fields or choose another scaler file.")
+                note = " Used existing scaler."
+            fitted = scaler is None
+
+            results, scaler = pp.preprocess_folder(paths, fs, low, high, notch or None, scaler=scaler,
+                                                   progress=self._set_progress)
+            if fitted and scaler_path and pp.save_scaler_if_missing(scaler_path, scaler, now):
+                note = f" Saved new scaler to {scaler_path}."
+            for p, df in results:
+                df.to_csv(os.path.splitext(p)[0] + "_preprocessed.csv", index=False)
+
+            first_path, first_df = results[0]
+            if len(results) == 1:
+                summary = f"{len(first_df)} rows saved to {os.path.splitext(first_path)[0]}_preprocessed.csv"
+            else:
+                total = sum(len(d) for _, d in results)
+                summary = (f"{len(results)} files, {total} rows saved next to each source as "
+                           f"*_preprocessed.csv (graph shows {os.path.basename(first_path)})")
+            self._pp_result = ("ok", pp.load_data(first_path), first_df, fs, summary, note)
         except Exception as e:  # shown to the user in the GUI
             self._pp_result = ("error", str(e))
 
     def _poll_pp(self):
         if self._pp_result is None:
+            if self._pp_progress:
+                self.pp_status.config(text=self._pp_progress)
             self.after(100, self._poll_pp)
             return
         self.pp_btn.config(state="normal")
@@ -465,9 +553,9 @@ class App(tk.Tk):
             self.pp_status.config(text=f"Error: {res[1]}")
             messagebox.showerror("Preprocessing failed", res[1])
             return
-        _, raw, out, fs, out_path = res
+        _, raw, out, fs, summary, note = res
         self.raw_df, self.pre_df = raw, out
-        self.pp_status.config(text=f"Done (fs={fs:.2f} Hz). {len(out)} rows saved to {out_path}")
+        self.pp_status.config(text=f"Done (fs={fs:.2f} Hz). {summary}.{note}")
         self.view_var.set(PRE_FILE)
         self.apply_view()
 
@@ -477,17 +565,15 @@ class App(tk.Tk):
         ax = self.ax
 
         if mode in LIVE_VIEWS:
-            pre = mode == LIVE_PRE
-            bufs = self.live_pre_buffers if pre else self.live_buffers
             x = np.arange(WINDOW_SIZE)
             for i, ln in enumerate(self.lines):
-                ln.set_data(x, list(bufs[i]))
+                ln.set_data(x, list(self.live_buffers[i]))
                 ln.set_label(f"V{i+1}")
             ax.set_xlim(0, WINDOW_SIZE - 1)
-            ax.set_ylim(*(LIVE_PRE_YLIM if pre else LIVE_YLIM))
+            ax.set_ylim(*LIVE_YLIM)
             ax.set_xlabel("Latest samples")
-            ax.set_ylabel("Standardised value (clipped to +/-3)" if pre else "ADC value")
-            ax.set_title("Live EMG (preprocessed)" if pre else "Live EMG (raw)")
+            ax.set_ylabel("ADC value")
+            ax.set_title("Live EMG (raw)")
         else:
             df = self.raw_df if mode == REC_RAW else self.pre_df
             cols = []

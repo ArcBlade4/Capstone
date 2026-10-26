@@ -1,56 +1,69 @@
-import numpy as np
-import pandas as pd
-from scipy.signal import iirnotch, butter, lfilter, sosfilt, sosfilt_zi, tf2sos
-from sklearn.preprocessing import StandardScaler
+"""
+Preprocessing.py - single-file / live preprocessing that uses the SAME methods as PREPRO.py.
+
+PREPRO.preprocess order, mirrored here:
+    outliers (z-score from the MEAN, on the raw readings)
+    -> resample onto an even time grid (uses the Time column)
+    -> zero-centre -> notch (optional) -> Butterworth band-pass (order 4, causal)
+PREPRO.make_datasets, mirrored here:
+    windows only where the label is a known gesture and constant, optionally skipping real gaps
+    channel mean/std come from the TRAINING part only (first 1 - val_frac - test_frac of the file)
+
+Not mirrored (they need many recordings): class balancing and noise augmentation.
+"""
 import os
 import pickle
 
-# Windowing settings (adjust to your data)
-SAMPLE_RATE = 40 
-WINDOW_MS = 300                                 
-WINDOW_SIZE = SAMPLE_RATE * WINDOW_MS // 1000  
-STEP = 4                  
-GESTURES = {"fist": 1, "flexion": 2, "extension": 3, "radial": 4, "ulnar": 5, "rest": 6, "table": 7}
-GESTURE_NAMES = list(GESTURES.values())   
+import numpy as np
+import pandas as pd
+from scipy.signal import (iirnotch, butter, lfilter, filtfilt, sosfilt, sosfiltfilt,
+                          sosfilt_zi, tf2sos)
 
-# File loading
+# Settings: these must match what the model was trained with (PREPRO defaults shown)
+SAMPLE_RATE = 60                                # PREPRO: sample_rate=60
+WINDOW_MS = 300
+WINDOW_SIZE = SAMPLE_RATE * WINDOW_MS // 1000
+STEP = 4
+GESTURES = {"fist": 1, "flexion": 2, "extension": 3, "radial": 4, "ulnar": 5, "rest": 6, "table": 7}
+GESTURE_NAMES = list(GESTURES.values())
+
+
+# --------------------------------------------------------------------------------------
+# Loading
+# --------------------------------------------------------------------------------------
 def load_data(file_path):
-    """Load a CSV into a DataFrame (returns None on failure)."""
+    """Load a CSV into a DataFrame (returns None on failure). Same cleanup as PREPRO."""
     try:
-        return pd.read_csv(file_path)
+        t = pd.read_csv(file_path).dropna().reset_index(drop=True)   # drop an empty last row
+        t.columns = [c.strip() for c in t.columns]                   # " Gesture" -> "Gesture"
+        if "Gesture" in t.columns:
+            t["Gesture"] = t["Gesture"].astype(str).str.strip()
+        return t
     except Exception as e:
         print(f"Error loading data: {e}")
         return None
 
 
-# Split time and target columns from the data
 def split_time_target(data):
-    """
-    Returns (signal_data, time_column_or_None, target_column_or_None).
-    """
+    """Returns (signal_data, time_column_or_None, target_column_or_None)."""
     time_column = None
     target_column = None
-
     if 'Time' in data.columns:
         time_column = data['Time']
         data = data.drop(columns=['Time'])
-
     if 'Gesture' in data.columns:
-        target_column = data['Gesture']
+        target_column = data['Gesture'].astype(str).str.strip()
         data = data.drop(columns=['Gesture'])
-
     return data, time_column, target_column
 
 
-# Outlier removal
-def remove_outliers(data, time, target):
-    """Drop rows where any channel is more than 3 std from its median."""
-    numeric_cols = data.select_dtypes(include=np.number).columns
-    median = data[numeric_cols].median()
-    std = data[numeric_cols].std()
-
-    mask = ((data[numeric_cols] - median).abs() <= 3 * std).all(axis=1)
-
+# --------------------------------------------------------------------------------------
+# Cleaning steps (PREPRO.preprocess)
+# --------------------------------------------------------------------------------------
+def remove_outliers(data, time, target, z=3.0):
+    """Drop rows where any channel is more than z std from its MEAN (PREPRO._within_z)."""
+    mean, std = data.mean(), data.std()
+    mask = ((data - mean).abs() <= z * std).all(axis=1).to_numpy()
     print(f"Removed {(~mask).sum()} outliers ({(~mask).mean() * 100:.2f}%).")
     data = data[mask]
     time = time[mask] if time is not None else None
@@ -58,73 +71,110 @@ def remove_outliers(data, time, target):
     return data, time, target
 
 
-# Zero centering
+def resample_to_grid(data, time, target, fs, method="interp"):
+    """
+    Put the recording on an even grid of 1000/fs ms using the Time column (ms)
+    (PREPRO._resample). Returns (data, time, target, age_ms).
+    method "interp": linear interpolation; "last": copy the most recent real reading.
+    The label is always the most recent real reading's label.
+    age_ms = how long ago that real reading was (large = a real gap).
+    """
+    channels = list(data.columns)
+    rec = data.copy()
+    rec["__t"] = time.to_numpy(dtype=float)
+    if target is not None:
+        rec["__y"] = target.to_numpy()
+    rec = rec.sort_values("__t", kind="stable").drop_duplicates(subset="__t", keep="last")
+
+    times = rec["__t"].to_numpy()
+    grid = np.arange(times[0], times[-1] + 1e-9, 1000.0 / fs)
+    last = np.searchsorted(times, grid, side="right") - 1
+    out = {}
+    for ch in channels:
+        values = rec[ch].to_numpy(dtype=float)
+        out[ch] = np.interp(grid, times, values) if method == "interp" else values[last]
+    new_data = pd.DataFrame(out, columns=channels)
+    new_time = pd.Series(grid, name=time.name)
+    new_target = pd.Series(rec["__y"].to_numpy()[last], name=target.name) if target is not None else None
+    return new_data, new_time, new_target, grid - times[last]
+
+
 def zero_center(data):
     """Subtract each channel's mean."""
     return data - data.mean()
 
 
-# Noise reduction
-def notch_filter(data, fs, freq=50.0, quality_factor=30.0):
-    """
-    Remove power line noise. Skipped (with a message) if freq is at/above Nyquist.
-    """
+def notch_filter(data, fs, freq=None, quality_factor=30.0, causal=True):
+    """Notch filter (PREPRO: off by default). Skipped if freq is None/0 or at/above Nyquist."""
+    if not freq:
+        return data
     if freq >= fs / 2:
         print(f"Skipping notch filter: {freq} Hz is above Nyquist ({fs/2} Hz).")
         return data
     b, a = iirnotch(freq, quality_factor, fs)
-    filtered_data = lfilter(b, a, data, axis=0)
-    return pd.DataFrame(filtered_data, columns=data.columns, index=data.index)
+    x = data.to_numpy(dtype=float)
+    y = lfilter(b, a, x, axis=0) if causal else filtfilt(b, a, x, axis=0)
+    return pd.DataFrame(y, columns=data.columns, index=data.index)
 
 
-# Bandpass filter
-def bandpass_filter(data, lowcut, highcut, fs, order=5):
-    """
-    Butterworth bandpass applied along time (axis 0) for every channel.
-    """
-    nyq = 0.5 * fs
-    if not (0 < lowcut < highcut < nyq):
-        raise ValueError(
-            f"Bandpass needs 0 < lowcut < highcut < Nyquist ({nyq:g} Hz); "
-            f"got {lowcut:g}-{highcut:g} Hz at fs={fs:g} Hz."
-        )
-    sos = butter(order, [lowcut / nyq, highcut / nyq], btype='band', output='sos')
-    # NOTE: axis=0 is time. The default (axis=-1) would filter across channels.
-    filtered_data = sosfilt(sos, data, axis=0)
-    return pd.DataFrame(filtered_data, columns=data.columns, index=data.index)
+def _band_sos(fs, lowcut, highcut, order):
+    """Butterworth band/high/low-pass as SOS (None if both edges are None)."""
+    nyq = fs / 2
+    for name, f in (("lowcut", lowcut), ("highcut", highcut)):
+        if f and not 0 < f < nyq:
+            raise ValueError(f"{name}={f} must be between 0 and {nyq:g} Hz (half of fs={fs:g})")
+    if lowcut and highcut:
+        if lowcut >= highcut:
+            raise ValueError(f"lowcut ({lowcut}) must be below highcut ({highcut})")
+        return butter(order, [lowcut, highcut], btype="bandpass", fs=fs, output="sos")
+    if lowcut:
+        return butter(order, lowcut, btype="highpass", fs=fs, output="sos")
+    if highcut:
+        return butter(order, highcut, btype="lowpass", fs=fs, output="sos")
+    return None
 
 
-# Scaling
-def scale_data(data, scaler=None):
-    """
-    Standardise each channel (zero mean, unit variance).
-    Fits a new StandardScaler unless one is given. Returns (scaled_df, scaler).
-    """
-    values = data.to_numpy(dtype=float)
-    if scaler is None:
-        scaler = StandardScaler().fit(values)
-    return pd.DataFrame(scaler.transform(values), columns=data.columns), scaler
- 
- 
-# Scaler file (pickle) shared between the offline pipeline and the live preprocessor
+def bandpass_filter(data, lowcut, highcut, fs, order=4, causal=True):
+    """Butterworth band-pass along time (axis 0). causal=True looks only at the past."""
+    sos = _band_sos(fs, lowcut, highcut, order)
+    if sos is None:
+        return data
+    x = data.to_numpy(dtype=float)
+    y = sosfilt(sos, x, axis=0) if causal else sosfiltfilt(sos, x, axis=0)
+    return pd.DataFrame(y, columns=data.columns, index=data.index)
+
+
+# --------------------------------------------------------------------------------------
+# Scaling: fixed per-channel mean/std from training data (PREPRO.make_datasets)
+# --------------------------------------------------------------------------------------
+class ChannelScaler:
+    """(x - mean) / std per channel. Same job as PREPRO's channel_mean / channel_std."""
+
+    def __init__(self, mean, std):
+        self.mean_ = np.asarray(mean, dtype=float)
+        self.scale_ = np.asarray(std, dtype=float)
+
+    def transform(self, x):
+        return (np.asarray(x, dtype=float) - self.mean_) / self.scale_
+
+
 def save_scaler_if_missing(path, scaler, settings):
     """
-    Pickle {"scaler": scaler, "settings": settings} to path, but only if the file
-    does not exist yet (an existing scaler is never overwritten).
+    Pickle the channel mean/std (+ settings) to path, only if the file does not exist yet.
     Returns True if the file was written.
     """
     if os.path.exists(path):
         return False
     with open(path, 'wb') as f:
-        pickle.dump({"scaler": scaler, "settings": dict(settings)}, f)
+        pickle.dump({"mean": scaler.mean_, "std": scaler.scale_, "settings": dict(settings)}, f)
     return True
- 
- 
+
+
 def load_scaler(path):
     """
-    Load a scaler pickle. Returns (scaler, settings_dict).
+    Load a scaler pickle. Returns (ChannelScaler, settings_dict).
     Raises ValueError with a readable message if it is missing or invalid.
-    Only load pickle files you created yourself.
+    Also accepts the old format (a pickled StandardScaler). Only load pickles you created.
     """
     if not path or not os.path.exists(path):
         raise ValueError(f"Scaler file not found: {path or '(no path given)'}\n"
@@ -134,190 +184,203 @@ def load_scaler(path):
             obj = pickle.load(f)
     except Exception as e:
         raise ValueError(f"Could not read scaler file: {e}")
-    if isinstance(obj, dict) and "scaler" in obj:
-        scaler, settings = obj["scaler"], obj.get("settings", {})
-    else:
-        scaler, settings = obj, {}      # a bare pickled StandardScaler also works
-    if not (hasattr(scaler, "mean_") and hasattr(scaler, "scale_")):
-        raise ValueError("That pickle does not contain a fitted StandardScaler.")
+
+    settings = {}
+    if isinstance(obj, dict) and "mean" in obj and "std" in obj:
+        scaler, settings = ChannelScaler(obj["mean"], obj["std"]), obj.get("settings", {})
+    else:                                           # old format
+        old = obj["scaler"] if isinstance(obj, dict) and "scaler" in obj else obj
+        settings = obj.get("settings", {}) if isinstance(obj, dict) else {}
+        if not (hasattr(old, "mean_") and hasattr(old, "scale_")):
+            raise ValueError("That pickle does not contain channel mean/std.")
+        scaler = ChannelScaler(old.mean_, old.scale_)
     return scaler, settings
 
 
+# --------------------------------------------------------------------------------------
+# Windowing (PREPRO.make_datasets, window cutting part)
+# --------------------------------------------------------------------------------------
+def make_windows(x, labels, window_size=WINDOW_SIZE, step=STEP, stale=None):
+    """Slide a window along ONE recording.
 
+    x       : signal, shape [samples, channels]
+    labels  : gesture label (string) of every sample
+    stale   : optional bool array, True = sample sits in/after a real gap; such windows are skipped
 
-# Pipeline
-def preprocess_pipeline(data, fs, lowcut, highcut, notch_freq=50.0, window=False):
+    Returns the windows, their labels, and each window's start position.
     """
-    zero-centre -> notch -> bandpass -> outlier removal -> scaling
-    (-> windowing, if window=True).
-    Time / Gesture columns are split off first and re-attached at the end
-    (only if they were present in the input).
+    labels = np.asarray(labels)
+    windows, window_labels, starts = [], [], []
+    for start in range(0, len(x) - window_size + 1, step):
+        end = start + window_size
+        gesture = labels[start]
+        if gesture not in GESTURES or np.any(labels[start:end] != gesture):
+            continue                                # not a gesture, or the label changes
+        if stale is not None and stale[start:end].any():
+            continue                                # window spans a real gap
+        windows.append(x[start:end])
+        window_labels.append(gesture)
+        starts.append(start)
+    return windows, window_labels, starts
 
-    Returns the preprocessed DataFrame. With window=True it returns
-    (df, windows, window_labels, starts) instead, and the input must
-    contain a 'Gesture' column.
+
+# --------------------------------------------------------------------------------------
+# Pipeline (offline)
+# --------------------------------------------------------------------------------------
+def preprocess_pipeline(data, fs, lowcut, highcut, notch_freq=None, window=False,
+                        resample=True, resample_method="interp", outlier_z=3.0,
+                        order=4, causal=True, scale=True, scaler=None,
+                        val_frac=0.2, test_frac=0.2, max_gap_ms=None,
+                        window_size=WINDOW_SIZE, step=STEP):
+    """
+    outliers -> resample -> zero-centre -> notch -> bandpass -> scaling (-> windowing)
+    Time / Gesture columns are split off first and re-attached at the end.
+
+    resample    : needs a 'Time' column (ms); skipped (rows assumed evenly spaced) without one
+    outlier_z   : None keeps every row
+    scale       : standardise with a ChannelScaler. If `scaler` is None, mean/std are fitted on the
+                  training part only: windows ending inside the first (1 - val_frac - test_frac)
+                  of the recording (rows, if there are no labels). The fitted scaler is in df.attrs["scaler"].
+    max_gap_ms  : skip windows containing a real gap longer than this (None = no check)
+
+    Returns the DataFrame. With window=True returns (df, windows, window_labels, starts);
+    the input must contain a 'Gesture' column. Windows are scaled the same way as df.
     """
     data, time, target = split_time_target(data)
+    data = data.astype(float)
+    if window and target is None:
+        raise ValueError("window=True requires a 'Gesture' column in the input.")
 
-    data = zero_center(data)
-    data = notch_filter(data, fs, notch_freq)
-    data = bandpass_filter(data, lowcut, highcut, fs)
-    data, time, target = remove_outliers(data, time, target)
-
+    # 1. outliers on the raw readings
+    if outlier_z is not None:
+        data, time, target = remove_outliers(data, time, target, outlier_z)
     data = data.reset_index(drop=True)
-    if time is not None:
-        time = time.reset_index(drop=True)
+    time = time.reset_index(drop=True) if time is not None else None
+    target = target.reset_index(drop=True) if target is not None else None
+
+    # 2. even time grid
+    age = None
+    if resample and time is not None:
+        data, time, target, age = resample_to_grid(data, time, target, fs, resample_method)
+    elif resample:
+        print("No 'Time' column: not resampling, rows are assumed evenly spaced.")
+
+    stale = None
+    if max_gap_ms is not None:
+        if age is not None:
+            stale = age > max_gap_ms
+        elif time is not None:
+            stale = np.zeros(len(data), dtype=bool)
+            stale[1:] = np.diff(time.to_numpy(dtype=float)) > max_gap_ms
+
+    # 3. filters
+    data = zero_center(data)
+    data = notch_filter(data, fs, notch_freq, causal=causal)
+    data = bandpass_filter(data, lowcut, highcut, fs, order=order, causal=causal)
+
+    # 4. windows (unscaled) and scaling statistics from the training part only
+    x = data.to_numpy()
+    windows, window_labels, starts = [], [], []
+    if target is not None and (window or (scale and scaler is None)):
+        windows, window_labels, starts = make_windows(x, target.to_numpy(), window_size, step, stale)
+
+    if scale:
+        if scaler is None:
+            cut1 = int(len(x) * (1 - val_frac - test_frac))
+            train = [w for w, s in zip(windows, starts) if s + window_size <= cut1]
+            if train:
+                arr = np.stack(train)
+            else:
+                print("No training windows found: fitting the scaler on the training rows instead.")
+                arr = x[:cut1] if cut1 > 1 else x
+            scaler = ChannelScaler(arr.mean(axis=tuple(range(arr.ndim - 1))),
+                                   arr.std(axis=tuple(range(arr.ndim - 1))) + 1e-8)
+        data = pd.DataFrame(scaler.transform(x), columns=data.columns)
+        windows = [scaler.transform(w).astype(np.float32) for w in windows]
+    else:
+        data = data.reset_index(drop=True)
+    data.attrs["scaler"] = scaler
+
     if target is not None:
-        target = target.reset_index(drop=True)
-
-    data, scaler = load_data(data)
-
-    # Windowing uses the scaled signal and its labels (before they are re-attached)
-    if window:
-        if target is None:
-            raise ValueError("window=True requires a 'Gesture' column in the input.")
-        windows, window_labels, starts = make_windows(data.to_numpy(), target.to_numpy())
-
-    if target is not None:
-        data.insert(len(data.columns), 'Gesture', target)
+        data.insert(len(data.columns), 'Gesture', target.to_numpy())
     if time is not None:
-        data.insert(0, 'Time', time)
+        data.insert(0, 'Time', time.to_numpy())
 
     if window:
         return data, windows, window_labels, starts
     return data
 
 
-# Windowing
-def make_windows(x, labels):
-    """Slide a window along the signal.
-
-    x       : signal, shape [samples, 8] (all recordings stored end to end)
-    labels  : gesture label of every sample, same length as x
-
-    Returns the windows, their labels, and each window's start position.
+# --------------------------------------------------------------------------------------
+# Several recordings at once (PREPRO.preprocess + the statistics part of make_datasets)
+# --------------------------------------------------------------------------------------
+def preprocess_folder(paths, fs, lowcut, highcut, notch_freq=None, scaler=None, balance=True,
+                      val_frac=0.2, test_frac=0.2, seed=0, window_size=WINDOW_SIZE, step=STEP,
+                      max_gap_ms=None, progress=None, **kw):
     """
-    windows, window_labels, starts = [], [], []    # results are collected here
+    Clean every file separately (outliers, resample, filters: nothing leaks across files), then
+    standardise all of them with ONE scaler, like PREPRO: mean/std come from the training windows
+    of all files (first 1 - val_frac - test_frac of each recording), with every gesture capped at
+    the median window count when balance=True. A given `scaler` is used as is.
 
-    # Try a window at every STEP-th position. The last start is
-    # len(x) - WINDOW_SIZE, so the final window still fits inside the signal.
-    for start in range(0, len(x) - WINDOW_SIZE + 1, STEP):
-        end = start + WINDOW_SIZE                  # one past the window's last sample
-        chunk_labels = labels[start:end]           # the label of every sample in this window
-        gesture = chunk_labels[0]                  # the label the window starts with
+    paths    : list of CSV/TXT paths
+    progress : optional function(str) called with status messages
+    **kw     : passed to preprocess_pipeline (resample, resample_method, outlier_z, order, causal)
 
-        # Rule 1: the window must start on a gesture we classify
-        if gesture not in GESTURES:                # skip pauses (0) and unused gestures
-            continue
-
-        # Rule 2: every sample must have that same label. This also drops
-        # windows that run from one file into the next, because neighbouring
-        # files hold different gestures.
-        if np.any(chunk_labels != gesture):        # skip windows that cross into another label
-            continue
-
-        # The window passed both rules: keep it
-        windows.append(x[start:end])               # the signal itself, shape [WINDOW_SIZE, 8]
-        window_labels.append(gesture)              # its gesture
-        starts.append(start)                       # where it begins, needed later for the time-based split
-    return windows, window_labels, starts
-
-
-# Live / streaming version of the pipeline
-class StreamingPreprocessor:
+    Returns ([(path, DataFrame), ...], scaler).
     """
-    Real-time counterpart of preprocess_pipeline. Feed it samples as they
-    arrive (any chunk size) and it returns the preprocessed samples.
+    cleaned, train_w, train_y, train_rows = [], [], [], []
+    for i, path in enumerate(paths):
+        if progress:
+            progress(f"Cleaning file {i + 1}/{len(paths)}: {os.path.basename(path)}")
+        raw = load_data(path)
+        if raw is None or raw.empty:
+            raise ValueError(f"Could not read any data from {path}")
+        has_y = "Gesture" in raw.columns
+        out = preprocess_pipeline(raw, fs, lowcut, highcut, notch_freq, window=has_y, scale=False,
+                                  val_frac=val_frac, test_frac=test_frac, window_size=window_size,
+                                  step=step, max_gap_ms=max_gap_ms, **kw)
+        windows, labels, starts = [], [], []
+        if has_y:
+            df, windows, labels, starts = out
+        else:
+            df = out
+        chs = [c for c in df.columns if c not in ("Time", "Gesture")]
+        cut1 = int(len(df) * (1 - val_frac - test_frac))
+        for w, y, st in zip(windows, labels, starts):
+            if st + window_size <= cut1:                 # training part only
+                train_w.append(w)
+                train_y.append(y)
+        train_rows.append(df[chs].to_numpy()[:cut1])
+        cleaned.append((path, df, chs))
 
-    Differences from the offline pipeline (a live stream has no "whole file"):
-      * notch + bandpass are the same filters, but their state is carried
-        between calls, and started from the first sample to avoid a transient
-      * zero-centring is dropped (the bandpass removes DC anyway)
-      * outliers are clipped to +/- clip_sigma instead of removed, so the
-        stream keeps its timing
-      * scaling uses running statistics (cumulative at first, then an
-        exponential moving average over ~stats_window_s seconds)
-      * the first warmup_s seconds are output as 0 while the statistics settle
+    if scaler is None:
+        if progress:
+            progress("Fitting the scaler on the training windows...")
+        if train_w:
+            idx = np.arange(len(train_y))
+            if balance:
+                y = np.asarray(train_y)
+                labs, counts = np.unique(y, return_counts=True)
+                cap = int(np.median(counts))
+                rng = np.random.default_rng(seed)
+                keep = []
+                for lab in labs:
+                    ii = np.flatnonzero(y == lab)
+                    if len(ii) > cap:
+                        ii = rng.choice(ii, cap, replace=False)
+                    keep.extend(ii)
+                idx = np.sort(keep)
+            arr = np.stack([train_w[i] for i in idx])
+        else:
+            print("No training windows found: fitting the scaler on the training rows instead.")
+            arr = np.vstack(train_rows)
+        ax = tuple(range(arr.ndim - 1))
+        scaler = ChannelScaler(arr.mean(axis=ax), arr.std(axis=ax) + 1e-8)
 
-    Takes:
-    fs: float - sampling rate in Hz
-    lowcut, highcut: float - bandpass edges in Hz
-    notch_freq: float - mains frequency; skipped if at/above Nyquist (or 0)
-    n_channels: int - number of signal channels
-
-    process(samples) takes an array of shape (n, n_channels) and returns the
-    same shape. reset() clears all state (call it after a gap in the data).
-    """
-
-    def __init__(self, fs, lowcut, highcut, notch_freq=50.0, n_channels=8,
-                 order=5, quality_factor=30.0, stats_window_s=10.0,
-                 warmup_s=2.0, clip_sigma=3.0):
-        nyq = fs / 2
-        if not (0 < lowcut < highcut < nyq):
-            raise ValueError(
-                f"Bandpass needs 0 < lowcut < highcut < Nyquist ({nyq:g} Hz); "
-                f"got {lowcut:g}-{highcut:g} Hz at fs={fs:g} Hz."
-            )
-
-        sections = []
-        self.notch_active = bool(notch_freq) and 0 < notch_freq < nyq
-        if self.notch_active:
-            b, a = iirnotch(notch_freq, quality_factor, fs)
-            sections.append(tf2sos(b, a))
-        sections.append(butter(order, [lowcut / nyq, highcut / nyq],
-                               btype='band', output='sos'))
-        self.sos = np.vstack(sections)
-        self._zi_unit = sosfilt_zi(self.sos)   # state for a unit step input
-
-        self.n_channels = n_channels
-        self.alpha = 1.0 - np.exp(-1.0 / (stats_window_s * fs))
-        self.warmup = int(warmup_s * fs)
-        self.clip_sigma = clip_sigma
-        self.reset()
-
-    def reset(self):
-        self.zi = None
-        self.count = 0
-        self.mean = np.zeros(self.n_channels)
-        self.var = np.zeros(self.n_channels)
-
-    def process(self, samples):
-        x = np.atleast_2d(np.asarray(samples, dtype=float))
-        if x.shape[1] != self.n_channels:
-            raise ValueError(f"Expected {self.n_channels} channels, got {x.shape[1]}.")
-        if len(x) == 0:
-            return x
-
-        if self.zi is None:
-            # start the filters as if the signal had always been at its first value
-            self.zi = self._zi_unit[:, :, None] * x[0][None, None, :]   # (sections, 2, channels)
-        y, self.zi = sosfilt(self.sos, x, axis=0, zi=self.zi)
-
-        out = np.zeros_like(y)
-        for k in range(len(y)):
-            self.count += 1
-            a = max(1.0 / self.count, self.alpha)
-
-            if self.count > self.warmup:
-                std = np.maximum(np.sqrt(self.var), 1e-8)
-                z = np.clip((y[k] - self.mean) / std, -self.clip_sigma, self.clip_sigma)
-                out[k] = z
-                v = self.mean + z * std        # clipped value feeds the statistics
-            else:
-                v = y[k]
-
-            d = v - self.mean
-            self.mean = self.mean + a * d
-            self.var = (1.0 - a) * (self.var + a * d * d)
-        return out
-
-
-if __name__ == "__main__":
-    # Command-line use (the GUI imports this module and does not run this block)
-    df = load_data('01.csv')
-    print(df)
-    df, windows, window_labels, starts = preprocess_pipeline(
-        df, fs=200, lowcut=1, highcut=9, window=True)
-    print(df.head())
-    print(f"{len(windows)} windows of shape {windows[0].shape}" if windows else "No windows found.")
-    df.to_csv('preprocessed_data.csv', index=False)
+    results = []
+    for path, df, chs in cleaned:
+        df[chs] = scaler.transform(df[chs].to_numpy())
+        df.attrs["scaler"] = scaler
+        results.append((path, df))
+    return results, scaler
