@@ -1,5 +1,5 @@
 """
-gui.py - EMG Data Studio
+main.py
 
 One window that:
   1. collects data from the serial port into a CSV (with pause / resume / stop).
