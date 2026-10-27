@@ -10,7 +10,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 #Replace the file path with whichever CSV file of the position to visualise
-df = pd.read_csv("franticData.csv")
+df = pd.read_csv("csv_data/01.csv")
 
 #Set by the sEMG device
 sampling_rate = 500 
