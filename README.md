@@ -65,9 +65,9 @@ project/
 
 Recommended Python version: 3.11+
 
-'''bash
+```bash
 pip install numpy pandas scipy pyserial torch
-'''
+```
 Optional, only if you load other model formats in the Classify tab: `tensorflow` (`.keras`/`.h5`), `onnxruntime` (`.onnx`), `joblib`/`scikit-learn` (`.pkl`/`.joblib`). `tkinter` ships with Python.
  
 Training uses a GPU automatically if CUDA is available, otherwise the CPU.
