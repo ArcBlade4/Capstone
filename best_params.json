@@ -1,0 +1,15 @@
+{
+ "CNN-LSTM": {
+  "lr": 0.0040619880891515974,
+  "weight_decay": 8.504021823437331e-06,
+  "batch_size": 64,
+  "dropout": 0.025240962295266033,
+  "width": 32,
+  "kernel_size": 5,
+  "hidden": 128,
+  "cnn_layers": 1,
+  "stride": 2,
+  "lstm_layers": 1,
+  "use_features": true
+ }
+}
