@@ -30,11 +30,11 @@ import classifier
 import collector
 import Preprocessing as pp
 
-WINDOW_SIZE = 300            # samples shown in the live view
+WINDOW_SIZE = 250            # samples shown in the live view
 MAX_STATIC_POINTS = 20000    # downsample long recordings for plotting only
 LIVE_YLIM = (-50, 4500)
 NUM_CH = 8
-UI_POLL_MS = 40
+UI_POLL_MS = 60
 LIVE_RAW = "Live (raw)"
 REC_RAW = "Recorded (raw)"
 PRE_FILE = "Preprocessed (file)"
