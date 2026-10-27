@@ -20,10 +20,10 @@ from scipy.signal import (iirnotch, butter, lfilter, filtfilt, sosfilt, sosfiltf
                           sosfilt_zi, tf2sos)
 
 # Settings: these must match what the model was trained with (PREPRO defaults shown)
-SAMPLE_RATE = 60                                # PREPRO: sample_rate=60
-WINDOW_MS = 300
+SAMPLE_RATE = 40
+WINDOW_MS = 250
 WINDOW_SIZE = SAMPLE_RATE * WINDOW_MS // 1000
-STEP = 4
+STEP = 2
 GESTURES = {"fist": 1, "flexion": 2, "extension": 3, "radial": 4, "ulnar": 5, "rest": 6, "table": 7}
 GESTURE_NAMES = list(GESTURES.values())
 
@@ -230,7 +230,7 @@ def make_windows(x, labels, window_size=WINDOW_SIZE, step=STEP, stale=None):
 def preprocess_pipeline(data, fs, lowcut, highcut, notch_freq=None, window=False,
                         resample=True, resample_method="interp", outlier_z=3.0,
                         order=4, causal=True, scale=True, scaler=None,
-                        val_frac=0.2, test_frac=0.2, max_gap_ms=None,
+                        val_frac=0.2, test_frac=0.1, max_gap_ms=None,
                         window_size=WINDOW_SIZE, step=STEP):
     """
     outliers -> resample -> zero-centre -> notch -> bandpass -> scaling (-> windowing)

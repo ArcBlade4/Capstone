@@ -3,7 +3,7 @@ main.py
 
 One window that:
   1. collects data from the serial port into a CSV (with pause / resume / stop).
-     The values saved to the CSV are the live-PREPROCESSED values.
+     The values saved to the CSV are the RAW readings (preprocess them in the Preprocess tab).
   2. preprocesses a (raw) CSV with Preprocessing.py
   3. shows a graph you can toggle: view (Live / Recorded raw / Preprocessed),
      individual channels V1-V8, and the whole graph on/off
@@ -26,6 +26,7 @@ import serial.tools.list_ports
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
+import classifier
 import collector
 import Preprocessing as pp
 
@@ -56,6 +57,10 @@ class App(tk.Tk):
         self.pre_df = None
         self._pp_result = None
         self._pp_progress = ""
+        self.model = None            # loaded classifier (classifier.ModelWrapper)
+        self._model_path = None
+        self._cls_result = None
+        self._cls_progress = ""
         self.live_buffers = [
             collections.deque([0.0] * WINDOW_SIZE, maxlen=WINDOW_SIZE) for _ in range(NUM_CH)
         ]
@@ -153,6 +158,42 @@ class App(tk.Tk):
         self.pp_status = ttk.Label(pbox, text="", wraplength=300, foreground="#555")
         self.pp_status.grid(row=8, column=0, columnspan=3, sticky="w")
         self._sync_fs_entry()
+
+        # ---- Classify tab: feed preprocessed data to an ML model
+        cbox = ttk.Frame(self.tabs, padding=8)
+        self.tabs.add(cbox, text="Classify")
+        cbox.columnconfigure(1, weight=1)
+
+        self.model_var = tk.StringVar()
+        self.cls_src = tk.StringVar(value="current")
+        self.cls_in_var = tk.StringVar()
+        self.cls_raw = tk.BooleanVar(value=False)
+
+        ttk.Label(cbox, text="Model").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Entry(cbox, textvariable=self.model_var, width=22).grid(row=0, column=1, sticky="ew", pady=2)
+        ttk.Button(cbox, text="Browse", width=8, command=self.browse_model).grid(row=0, column=2, padx=(4, 0))
+
+        ttk.Label(cbox, text="Data").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Radiobutton(cbox, text="Current preprocessed data (graph)", value="current",
+                        variable=self.cls_src).grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Radiobutton(cbox, text="CSV file:", value="file",
+                        variable=self.cls_src).grid(row=2, column=1, sticky="w")
+        ttk.Entry(cbox, textvariable=self.cls_in_var, width=22).grid(row=3, column=1, sticky="ew", pady=2)
+        ttk.Button(cbox, text="Browse", width=8, command=self.browse_cls_in).grid(row=3, column=2, padx=(4, 0))
+        ttk.Checkbutton(cbox, text="File is raw: preprocess it first (uses Preprocess tab settings + scaler)",
+                        variable=self.cls_raw).grid(row=4, column=0, columnspan=3, sticky="w")
+
+        self.cls_btn = ttk.Button(cbox, text="Classify", command=self.run_classify)
+        self.cls_btn.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(8, 2))
+        self.cls_status = ttk.Label(cbox, text="", wraplength=300, foreground="#555")
+        self.cls_status.grid(row=6, column=0, columnspan=3, sticky="w")
+
+        cols = ("time", "prediction", "conf", "truth")
+        self.cls_tree = ttk.Treeview(cbox, columns=cols, show="headings", height=8)
+        for c, w in zip(cols, (60, 80, 50, 70)):
+            self.cls_tree.heading(c, text=c)
+            self.cls_tree.column(c, width=w, anchor="center")
+        self.cls_tree.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(4, 0))
 
         # ---- 3. Graph controls
         gbox = ttk.LabelFrame(side, text="Graph", padding=8)
@@ -284,27 +325,8 @@ class App(tk.Tk):
         return diff
 
     # ------------------------------------------------------------ recording
-    def _live_pp_params(self):
-        """Parse + validate the settings for the recording process."""
-        fs, low, high, notch, scaler_path = self._read_pp_settings()
-        scaler = None
-        if scaler_path and os.path.exists(scaler_path):
-            scaler, saved = pp.load_scaler(scaler_path)          # raises ValueError if unreadable
-            diff = self._settings_diff(saved, self._scaler_settings(fs, low, high, notch))
-            if diff:
-                raise ValueError("The scaler file was made with different settings:\n  "
-                                 + "\n  ".join(diff) + "\nChange the fields or choose another scaler file.")
-        else:
-            scaler_path = None                                   # start_recording asks what to do
-        if fs is not None:   # with auto fs the rate isn't known until recording has started
-            pp.StreamingPreprocessor(fs, low, high, notch or None, n_channels=NUM_CH,
-                                     scaler=scaler)             # raises ValueError if invalid
-        return (fs, low, high, notch, scaler_path)
-
     def _rec_text(self, label):
-        if self.fs_used:
-            return f"{label} - {self.rows_seen} samples (fs {self.fs_used:.1f} Hz)"
-        return f"{label} - {self.rows_seen} samples (measuring sampling rate...)"
+        return f"{label} - {self.rows_seen} samples"
 
     def start_recording(self):
         port = self.port_var.get().strip()
@@ -324,18 +346,6 @@ class App(tk.Tk):
                 "Overwrite?", f"{os.path.basename(path)} already exists. Overwrite it?"):
             return
 
-        try:
-            pp_params = self._live_pp_params()
-        except ValueError as e:
-            messagebox.showerror("Preprocessing settings", str(e))
-            return
-        if pp_params[4] is None and not messagebox.askyesno(
-                "No scaler file",
-                "There is no scaler file yet, so the live values will be filtered but NOT standardised "
-                "(the saved CSV will not match the training scale).\n\n"
-                "Record anyway? (Run preprocessing on a recording first to create scaler.pkl.)"):
-            return
-
         s = dict(
             path=path,
             paused=mp.Value('b', 0),
@@ -347,7 +357,7 @@ class App(tk.Tk):
         )
         s['proc'] = mp.Process(
             target=collector.recorder,
-            args=(port, baud, path, pp_params, s['paused'], s['stop'], s['ready'],
+            args=(port, baud, path, s['paused'], s['stop'], s['ready'],
                   s['errors'], s['plot_q']),
             daemon=True,
         )
@@ -356,7 +366,7 @@ class App(tk.Tk):
         self.sess = s
         self.state = "connecting"
         self.rows_seen = 0
-        self.fs_used = pp_params[0]          # None until measured in auto mode
+        self.fs_used = None
         self.rec_status.config(text=f"Connecting to {port}...")
         self._set_buttons()
         self.after(50, self._poll_connect, s)
@@ -387,7 +397,7 @@ class App(tk.Tk):
         if self.sess is not s:
             return
 
-        # the recorder process does the preprocessing and saving; here we only display the raw signal
+        # the recorder process does the saving; here we only display the raw signal
         new_raw = []
         for _ in range(500):
             try:
@@ -397,7 +407,7 @@ class App(tk.Tk):
             if kind == "fs":
                 self.fs_used = payload
             else:
-                for _t, raw, _pre in payload:
+                for _t, raw in payload:
                     new_raw.append(raw)
         got = bool(new_raw)
         if got:
@@ -462,10 +472,11 @@ class App(tk.Tk):
         if was_started and os.path.exists(s['path']):
             df = pp.load_data(s['path'])
             if df is not None and len(df):
-                # the saved file is already preprocessed
-                self.pre_df = df
-                self.rec_status.config(text=f"Saved {len(df)} preprocessed rows to {s['path']}")
-                self.view_var.set(PRE_FILE)
+                # the saved file is raw: show it and queue it up for the Preprocess tab
+                self.raw_df = df
+                self.pp_in_var.set(s['path'])
+                self.rec_status.config(text=f"Saved {len(df)} raw rows to {s['path']}")
+                self.view_var.set(REC_RAW)
                 self.apply_view()
                 return
         if not error:
@@ -558,6 +569,122 @@ class App(tk.Tk):
         self.pp_status.config(text=f"Done (fs={fs:.2f} Hz). {summary}.{note}")
         self.view_var.set(PRE_FILE)
         self.apply_view()
+
+    # --------------------------------------------------------- classification
+    def browse_model(self):
+        p = filedialog.askopenfilename(filetypes=[
+            ("Models", "*.pt *.pth *.keras *.h5 *.onnx *.pkl *.joblib"), ("All files", "*.*")])
+        if p:
+            self.model_var.set(p)
+
+    def browse_cls_in(self):
+        p = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+        if p:
+            self.cls_in_var.set(p)
+            self.cls_src.set("file")
+
+    def run_classify(self):
+        model_path = self.model_var.get().strip()
+        if not model_path or not os.path.exists(model_path):
+            messagebox.showerror("No model", "Choose an existing model file.")
+            return
+        source = self.cls_src.get()
+        in_path, df, ppset = None, None, None
+        if source == "current":
+            if self.pre_df is None or not len(self.pre_df):
+                messagebox.showerror("No data", "There is no preprocessed data loaded yet. "
+                                     "Record or preprocess something first, or pick a CSV file.")
+                return
+            df = self.pre_df.copy()
+        else:
+            in_path = self.cls_in_var.get().strip()
+            if not in_path or not os.path.isfile(in_path):
+                messagebox.showerror("No input", "Choose an existing CSV file.")
+                return
+            if self.cls_raw.get():
+                try:
+                    ppset = self._read_pp_settings()
+                except ValueError as e:
+                    messagebox.showerror("Invalid value", str(e))
+                    return
+
+        self.cls_btn.config(state="disabled")
+        self.cls_status.config(text="Working...")
+        self._cls_progress = ""
+        self._cls_result = None
+        threading.Thread(target=self._cls_worker, args=(model_path, in_path, df, ppset),
+                         daemon=True).start()
+        self.after(100, self._poll_cls)
+
+    def _cls_worker(self, model_path, in_path, df, ppset):
+        try:
+            if self.model is None or self._model_path != model_path:
+                self._cls_progress = "Loading model..."
+                self.model = classifier.ModelWrapper(model_path)
+                self._model_path = model_path
+
+            if in_path is not None:
+                if ppset is None:                                 # already preprocessed
+                    df = pp.load_data(in_path)
+                else:                                             # raw: same steps as the Preprocess tab
+                    self._cls_progress = "Preprocessing..."
+                    fs, low, high, notch, scaler_path = ppset
+                    if not scaler_path or not os.path.exists(scaler_path):
+                        raise ValueError("A scaler file is needed to preprocess raw data "
+                                         "(run the Preprocess tab on training data first).")
+                    scaler, saved = pp.load_scaler(scaler_path)
+                    raw = pp.load_data(in_path)
+                    if fs is None:
+                        if raw is None or "Time" not in raw.columns:
+                            raise ValueError("No 'Time' column: untick auto fs and enter fs.")
+                        g = np.diff(raw["Time"].to_numpy(dtype=float))
+                        fs = 1000.0 / np.median(g[g > 0])
+                    diff = self._settings_diff(saved, self._scaler_settings(fs, low, high, notch))
+                    if diff:
+                        raise ValueError("The scaler file was made with different settings:\n  "
+                                         + "\n  ".join(diff))
+                    results, _ = pp.preprocess_folder([in_path], fs, low, high, notch or None, scaler=scaler)
+                    df = results[0][1]
+            if df is None or df.empty:
+                raise ValueError("Could not read any data.")
+
+            self._cls_progress = "Classifying..."
+            res = classifier.classify_dataframe(df, self.model)
+            out_path = (os.path.splitext(in_path)[0] + "_predictions.csv" if in_path
+                        else os.path.join(os.getcwd(), "predictions.csv"))
+            res.to_csv(out_path, index=False)
+            self._cls_result = ("ok", res, out_path)
+        except Exception as e:  # shown to the user in the GUI
+            self._cls_result = ("error", str(e))
+
+    def _poll_cls(self):
+        if self._cls_result is None:
+            if self._cls_progress:
+                self.cls_status.config(text=self._cls_progress)
+            self.after(100, self._poll_cls)
+            return
+        self.cls_btn.config(state="normal")
+        res, self._cls_result = self._cls_result, None
+        if res[0] == "error":
+            self.cls_status.config(text=f"Error: {res[1]}")
+            messagebox.showerror("Classification failed", res[1])
+            return
+        _, out, out_path = res
+
+        counts = out["prediction"].value_counts()
+        text = f"{len(out)} windows. " + ", ".join(f"{k}: {v}" for k, v in counts.items())
+        if "truth" in out.columns:
+            known = out[out["truth"].isin(pp.GESTURES)]
+            if len(known):
+                text += f"\nAccuracy vs. Gesture column: {(known['prediction'] == known['truth']).mean() * 100:.1f}%"
+        self.cls_status.config(text=text + f"\nSaved to {out_path}")
+
+        self.cls_tree.delete(*self.cls_tree.get_children())
+        step = max(1, len(out) // 500)                            # keep the table light
+        for _, r in out.iloc[::step].iterrows():
+            t = f"{r['end_time_ms']:.0f}" if "end_time_ms" in out.columns else int(r["start"])
+            conf = "" if np.isnan(r["confidence"]) else f"{r['confidence']:.2f}"
+            self.cls_tree.insert("", "end", values=(t, r["prediction"], conf, r.get("truth", "")))
 
     # ------------------------------------------------------------------ plot
     def apply_view(self):
