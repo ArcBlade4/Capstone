@@ -4,13 +4,11 @@ main.py
 One window that:
   1. collects data from the serial port into a CSV (with pause / resume / stop).
      The values saved to the CSV are the RAW readings (preprocess them in the Preprocess tab).
-     A gesture label (keys 0-7 or the radio buttons) can be changed while recording and is
-     saved in the Gesture column.
   2. preprocesses a (raw) CSV with Preprocessing.py
   3. shows a graph you can toggle: view (Live / Recorded raw / Preprocessed),
      individual channels V1-V8, and the whole graph on/off
 
-Run:  python main.py
+Run:  python gui.py
 Needs: pyserial pandas numpy scipy matplotlib   (tkinter ships with Python)
 """
 import collections
@@ -32,11 +30,11 @@ import classifier
 import collector
 import Preprocessing as pp
 
-WINDOW_SIZE = 250            # samples shown in the live view
+WINDOW_SIZE = 300            # samples shown in the live view
 MAX_STATIC_POINTS = 20000    # downsample long recordings for plotting only
 LIVE_YLIM = (-50, 4500)
 NUM_CH = 8
-UI_POLL_MS = 60
+UI_POLL_MS = 40
 LIVE_RAW = "Live (raw)"
 REC_RAW = "Recorded (raw)"
 PRE_FILE = "Preprocessed (file)"
@@ -117,19 +115,9 @@ class App(tk.Tk):
         for b in (self.start_btn, self.pause_btn, self.stop_btn):
             b.pack(side="left", expand=True, fill="x", padx=2)
 
-        # ---- gesture label (can be changed while recording)
-        self.label_var = tk.IntVar(value=0)
-        lbox = ttk.LabelFrame(box, text="Label (keys 0-7)", padding=4)
-        lbox.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        self.label_opts = [(0, "none")] + [(v, k) for k, v in pp.GESTURES.items()]
-        for n, (gid, gname) in enumerate(self.label_opts):
-            ttk.Radiobutton(lbox, text=f"{gid}  {gname}", value=gid, variable=self.label_var,
-                            command=self._on_label).grid(row=n % 4, column=n // 4, sticky="w", padx=6)
-        self.bind("<Key>", self._on_key)
-
         self.rec_status = ttk.Label(box, text="Idle", wraplength=300, foreground="#555")
-        self.rec_status.grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
+        self.rec_status.grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
+    
         # ---- Preprocess tab (settings used for BOTH live recording and the offline button)
         pbox = ttk.Frame(self.tabs, padding=8)
         self.tabs.add(pbox, text="Preprocess")
@@ -337,30 +325,8 @@ class App(tk.Tk):
         return diff
 
     # ------------------------------------------------------------ recording
-    def _label_name(self):
-        return dict(self.label_opts)[self.label_var.get()]
-
     def _rec_text(self, label):
-        return f"{label} - {self.rows_seen} samples - label: {self._label_name()}"
-
-    def _on_label(self):
-        """The label changed (radio button or key): pass it to the recorder process."""
-        s = self.sess
-        if s is not None:
-            s['label'].value = self.label_var.get()
-            if self.state == "recording":
-                self.rec_status.config(
-                    text=self._rec_text("PAUSED" if s['paused'].value else "Recording"))
-
-    def _on_key(self, event):
-        try:
-            if isinstance(self.focus_get(), tk.Entry):      # includes ttk.Entry and Combobox
-                return                                      # the user is typing a value
-        except KeyError:
-            return
-        if event.char and event.char in "01234567":
-            self.label_var.set(int(event.char))
-            self._on_label()
+        return f"{label} - {self.rows_seen} samples"
 
     def start_recording(self):
         port = self.port_var.get().strip()
@@ -383,7 +349,6 @@ class App(tk.Tk):
         s = dict(
             path=path,
             paused=mp.Value('b', 0),
-            label=mp.Value('i', self.label_var.get()),
             stop=mp.Event(),
             ready=mp.Event(),
             errors=mp.Queue(),
@@ -392,7 +357,7 @@ class App(tk.Tk):
         )
         s['proc'] = mp.Process(
             target=collector.recorder,
-            args=(port, baud, path, s['paused'], s['label'], s['stop'], s['ready'],
+            args=(port, baud, path, s['paused'], s['stop'], s['ready'],
                   s['errors'], s['plot_q']),
             daemon=True,
         )
@@ -543,7 +508,7 @@ class App(tk.Tk):
             if not paths:
                 raise ValueError("No .csv or .txt files found in that folder.")
 
-            if fs is None:                       # pool the gaps of all files, median as PREPRO.estimate_rate
+            if fs is None:                       # pool the gaps of all files, use the median
                 gaps = []
                 for p in paths:
                     raw = pp.load_data(p)
