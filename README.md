@@ -81,7 +81,7 @@ Time,V1,V2,V3,V4,V5,V6,V7,V8
 ```
  
 * `Time`: milliseconds since recording started (pauses are excluded).
-* `V1`–`V8`: integer ADC readings, one column per sensor channel.
+* `V1`–`V8`: integer readings, one column per sensor channel.
 * **Training files also need a `Gesture` column** with one of the gesture names above. Files recorded by `main.py` have the none label by default, so label must be chosen when creating training set.
 The device is expected to send one sample per line over serial: eight integers separated by spaces or commas, at 115200 baud by default. Malformed lines are dropped.
  
