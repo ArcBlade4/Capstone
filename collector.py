@@ -5,7 +5,8 @@ collector.py - serial acquisition and CSV writing.
   * reads every line the device sends (no 16 ms "latest value" sampling, so no dropped samples)
   * timestamps each sample from when it arrived (samples that arrive together in one
     serial chunk are spread evenly between the previous chunk and this one)
-  * writes the RAW values to the CSV and sends (time, raw) rows to the GUI for the live graph
+  * writes the RAW values plus the current gesture label to the CSV and sends (time, raw)
+    rows to the GUI for the live graph
 
 Filtering / scaling is done afterwards with the Preprocess tab (Preprocessing.py).
 """
@@ -15,17 +16,25 @@ import time
 
 import serial
 
+import Preprocessing as pp
+
 BAUDRATE = 115200
-HEADERS = ['Time', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'V7', 'V8']
-N_CH = len(HEADERS) - 1
+HEADERS = ['Time', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'V7', 'V8', 'Gesture']
+N_CH = 8                                   # signal channels (HEADERS also has Time and Gesture)
+
+# label id -> name; 0 = not labelled
+ID_TO_NAME = {0: "none", **{v: k for k, v in pp.GESTURES.items()}}
 
 
-def recorder(port, baudrate, file_path, paused_flag, stop_event,
+def recorder(port, baudrate, file_path, paused_flag, label_value, stop_event,
              ready_event, error_queue, plot_queue):
     """
     port, baudrate: serial settings
     file_path: str - where the raw CSV is saved
     paused_flag: mp.Value('b') - while true, incoming data is discarded
+    label_value: mp.Value('i') - id of the gesture currently being performed (0 = none);
+                 the GUI changes it while recording and every sample gets the value current
+                 when it arrived
     stop_event: mp.Event - signals the process to stop
     ready_event: mp.Event - set once the port and file are open
     error_queue: mp.Queue - a serial error message for the GUI
@@ -106,8 +115,9 @@ def recorder(port, baudrate, file_path, paused_flag, stop_event,
                 ts = [last_t + (now - last_t) * (k + 1) / n for k in range(n)]
                 last_t = now
 
+                label = ID_TO_NAME.get(label_value.value, "none")   # label at the time this chunk arrived
                 for t, v in zip(ts, vals):
-                    writer.writerow([int(round(t * 1000))] + v)
+                    writer.writerow([int(round(t * 1000))] + v + [label])
                 f.flush()
                 send(("rows", [(int(round(t * 1000)), v) for t, v in zip(ts, vals)]))
     finally:
