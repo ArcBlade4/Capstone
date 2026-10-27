@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 #Replace the file path with whichever CSV file of the position to visualise
-df = pd.read_csv("franticData.csv")
+df = pd.read_csv("csv_data/01.csv")
 
 #Separate the time axis and the EMG channels into separate variables
 emg_channels = ['V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'V7', 'V8']
