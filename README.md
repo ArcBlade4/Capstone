@@ -71,3 +71,61 @@ pip install numpy pandas scipy pyserial torch
 Training uses a GPU automatically if CUDA is available, otherwise the CPU.
  
 ---
+
+## Data format
+ 
+Raw recordings are CSV files with a header row:
+ 
+```
+Time,V1,V2,V3,V4,V5,V6,V7,V8
+```
+ 
+* `Time`: milliseconds since recording started (pauses are excluded).
+* `V1`–`V8`: integer ADC readings, one column per sensor channel.
+* **Training files also need a `Gesture` column** with one of the gesture names above. Files recorded by `main.py` have the none label by default, so label must be chosen when creating training set.
+The device is expected to send one sample per line over serial: eight integers separated by spaces or commas, at 115200 baud by default. Malformed lines are dropped.
+ 
+---
+
+# How to use
+
+## Training 
+
+1. Delete the old `CNN-LSTM_ts.pt` and `scaler.pkl`.
+2. Record data with `main.py` (Record tab), while changing labels per recording.
+3. Replace the contents of the `Data` folder with your recordings (one numbered subfolder per recording).
+4. Run the trainer from the `training` folder:
+```bash
+   python Final_train.py
+```
+5. Wait for training to finish. Three seeds are trained, each with early stopping (patience 8, max 60 epochs), and the seed with the best validation accuracy is kept.
+6. Check that `CNN-LSTM_ts.pt` and `scaler.pkl` exist. Copy them next to `main.py`.
+
+Files written by training:
+ 
+| File | Contents |
+|------|----------|
+| `best_CNN-LSTM_seed{N}.pt` | Best-epoch weights for each seed |
+| `CNN-LSTM_semg.pt` | Full checkpoint: weights, normalisation, preprocessing settings, window size, params |
+| `CNN-LSTM_model.pt` | Weights only |
+| `CNN-LSTM_semg_model.pkl` | Pickled model object (needs the class definitions) |
+| `CNN-LSTM_ts.pt` | **TorchScript model. This is the one the GUI uses** |
+| `scaler.pkl` | Per-channel mean/std and filter settings |
+ 
+The test split (last 10% of each recording) is held out but never used during training, so it is available for a separate evaluation.
+
+### Using the GUI
+ 
+```bash
+python main.py
+```
+ 
+1. **Record**: in the *Record data* tab choose the serial port and baud rate, choose where to save, choose label, and press **Start**. **Pause**/**Resume** discards incoming data while paused. **Stop** saves the file. The live graph shows raw values.
+2. **Preprocess**: in the *Preprocess* tab pick a file or folder, check the settings (they must match training), and press **Run preprocessing**. Output is saved next to each source as `*_preprocessed.csv`.
+3. **Classify**: in the *Classify* tab select `CNN-LSTM_ts.pt` as the model, then choose either:
+   * the current preprocessed data (what is on the graph), or
+   * a CSV file. Tick *File is raw* if it still needs preprocessing, which uses the Preprocess tab settings and the scaler.
+4. Press **Classify**. Results (window count per gesture, confidence, accuracy if a `Gesture` column exists) appear in the tab and are saved as `*_predictions.csv`.
+The graph can switch between **Live (raw)**, **Recorded (raw)** and **Preprocessed (file)**, with per-channel toggles for V1–V8.
+ 
+---
