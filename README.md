@@ -81,7 +81,7 @@ Time,V1,V2,V3,V4,V5,V6,V7,V8
 ```
  
 * `Time`: milliseconds since recording started (pauses are excluded).
-* `V1`–`V8`: integer readings, one column per sensor channel.
+* `V1`–`V8`: integer ADC (Analog-to-Digital Converter) readings, one column per sensor channel.
 * **Training files also need a `Gesture` column** with one of the gesture names above. Files recorded by `main.py` have the none label by default, so label must be chosen when creating training set.
 The device is expected to send one sample per line over serial: eight integers separated by spaces or commas, at 115200 baud by default. Malformed lines are dropped.
  
@@ -129,3 +129,25 @@ python main.py
 The graph can switch between **Live (raw)**, **Recorded (raw)** and **Preprocessed (file)**, with per-channel toggles for V1–V8.
  
 ---
+## Pipeline
+ 
+```
+Inputs ─► Data collection ─► Visualisation ─► Preprocessing ─► Model ─► Outputs
+```
+
+### Inputs
+* 8-channel sEMG from serial device (ADC integer values, 115200 baud)
+* Previously recorded CSV files (raw or already preprocessed)
+
+### Data collection (`collector.py`)
+ 
+* Runs as a separate process so the GUI never blocks acquisition.
+* Reads every line the device sends, with no "latest value" sampling, so no samples are dropped.
+* Timestamps from arrival time. Samples that arrive together in one serial chunk are spread evenly between the previous and current chunk.
+* Writes **raw** values to CSV and sends rows to the GUI for live plotting (the queue drops items if the GUI falls behind, but the CSV is never affected).
+
+### Visualisation (`main.py`)
+ 
+* Live scrolling view of the last 300 samples per channel.
+* Static views for recorded raw data and preprocessed data (downsampled to 20,000 points for plotting only).
+
