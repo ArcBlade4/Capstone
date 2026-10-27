@@ -1,15 +1,15 @@
 """
-Preprocessing.py - single-file / live preprocessing that uses the SAME methods as PREPRO.py.
+Preprocessing.py - single-file / live preprocessing for the sEMG gesture models.
 
-PREPRO.preprocess order, mirrored here:
+Order of the cleaning steps:
     outliers (z-score from the MEAN, on the raw readings)
     -> resample onto an even time grid (uses the Time column)
     -> zero-centre -> notch (optional) -> Butterworth band-pass (order 4, causal)
-PREPRO.make_datasets, mirrored here:
+Windowing and scaling:
     windows only where the label is a known gesture and constant, optionally skipping real gaps
     channel mean/std come from the TRAINING part only (first 1 - val_frac - test_frac of the file)
 
-Not mirrored (they need many recordings): class balancing and noise augmentation.
+Not included (they need many recordings): noise augmentation.
 """
 import os
 import pickle
@@ -19,7 +19,7 @@ import pandas as pd
 from scipy.signal import (iirnotch, butter, lfilter, filtfilt, sosfilt, sosfiltfilt,
                           sosfilt_zi, tf2sos)
 
-# Settings: these must match what the model was trained with (PREPRO defaults shown)
+# Settings: these must match what the model was trained with (default values shown)
 SAMPLE_RATE = 40
 WINDOW_MS = 250
 WINDOW_SIZE = SAMPLE_RATE * WINDOW_MS // 1000
@@ -32,7 +32,7 @@ GESTURE_NAMES = list(GESTURES.values())
 # Loading
 # --------------------------------------------------------------------------------------
 def load_data(file_path):
-    """Load a CSV into a DataFrame (returns None on failure). Same cleanup as PREPRO."""
+    """Load a CSV into a DataFrame (returns None on failure). Strips stray whitespace and drops empty rows."""
     try:
         t = pd.read_csv(file_path).dropna().reset_index(drop=True)   # drop an empty last row
         t.columns = [c.strip() for c in t.columns]                   # " Gesture" -> "Gesture"
@@ -58,10 +58,10 @@ def split_time_target(data):
 
 
 # --------------------------------------------------------------------------------------
-# Cleaning steps (PREPRO.preprocess)
+# Cleaning steps
 # --------------------------------------------------------------------------------------
 def remove_outliers(data, time, target, z=3.0):
-    """Drop rows where any channel is more than z std from its MEAN (PREPRO._within_z)."""
+    """Drop rows where any channel is more than z std from its MEAN."""
     mean, std = data.mean(), data.std()
     mask = ((data - mean).abs() <= z * std).all(axis=1).to_numpy()
     print(f"Removed {(~mask).sum()} outliers ({(~mask).mean() * 100:.2f}%).")
@@ -74,7 +74,7 @@ def remove_outliers(data, time, target, z=3.0):
 def resample_to_grid(data, time, target, fs, method="interp"):
     """
     Put the recording on an even grid of 1000/fs ms using the Time column (ms)
-    (PREPRO._resample). Returns (data, time, target, age_ms).
+    Returns (data, time, target, age_ms).
     method "interp": linear interpolation; "last": copy the most recent real reading.
     The label is always the most recent real reading's label.
     age_ms = how long ago that real reading was (large = a real gap).
@@ -105,7 +105,7 @@ def zero_center(data):
 
 
 def notch_filter(data, fs, freq=None, quality_factor=30.0, causal=True):
-    """Notch filter (PREPRO: off by default). Skipped if freq is None/0 or at/above Nyquist."""
+    """Notch filter (off by default). Skipped if freq is None/0 or at/above Nyquist."""
     if not freq:
         return data
     if freq >= fs / 2:
@@ -145,10 +145,10 @@ def bandpass_filter(data, lowcut, highcut, fs, order=4, causal=True):
 
 
 # --------------------------------------------------------------------------------------
-# Scaling: fixed per-channel mean/std from training data (PREPRO.make_datasets)
+# Scaling: fixed per-channel mean/std from training data
 # --------------------------------------------------------------------------------------
 class ChannelScaler:
-    """(x - mean) / std per channel. Same job as PREPRO's channel_mean / channel_std."""
+    """(x - mean) / std per channel."""
 
     def __init__(self, mean, std):
         self.mean_ = np.asarray(mean, dtype=float)
@@ -198,7 +198,7 @@ def load_scaler(path):
 
 
 # --------------------------------------------------------------------------------------
-# Windowing (PREPRO.make_datasets, window cutting part)
+# Windowing
 # --------------------------------------------------------------------------------------
 def make_windows(x, labels, window_size=WINDOW_SIZE, step=STEP, stale=None):
     """Slide a window along ONE recording.
@@ -312,14 +312,14 @@ def preprocess_pipeline(data, fs, lowcut, highcut, notch_freq=None, window=False
 
 
 # --------------------------------------------------------------------------------------
-# Several recordings at once (PREPRO.preprocess + the statistics part of make_datasets)
+# Several recordings at once
 # --------------------------------------------------------------------------------------
 def preprocess_folder(paths, fs, lowcut, highcut, notch_freq=None, scaler=None, balance=True,
                       val_frac=0.2, test_frac=0.2, seed=0, window_size=WINDOW_SIZE, step=STEP,
                       max_gap_ms=None, progress=None, **kw):
     """
     Clean every file separately (outliers, resample, filters: nothing leaks across files), then
-    standardise all of them with ONE scaler, like PREPRO: mean/std come from the training windows
+    standardise all of them with ONE scaler: mean/std come from the training windows
     of all files (first 1 - val_frac - test_frac of each recording), with every gesture capped at
     the median window count when balance=True. A given `scaler` is used as is.
 
