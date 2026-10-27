@@ -8,7 +8,7 @@ One window that:
   3. shows a graph you can toggle: view (Live / Recorded raw / Preprocessed),
      individual channels V1-V8, and the whole graph on/off
 
-Run:  python gui.py
+Run:  python main.py
 Needs: pyserial pandas numpy scipy matplotlib   (tkinter ships with Python)
 """
 import collections
