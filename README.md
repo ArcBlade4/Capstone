@@ -35,3 +35,41 @@ The model outputs one score per gesture. Output index `i` maps to gesture ID `i 
 | `classifier.py` | Loads a model (`.pt` TorchScript, `.keras`, `.onnx`, `.pkl`) and classifies preprocessed windows |
 | `PREPRO.py` | Training-side preprocessing: cleaning, windowing, chronological split, balancing, normalisation, augmentation |
 | `Final_train.py` | Trains the CNN-LSTM with several seeds and saves the best one |
+
+
+
+Expected layout for training:
+ 
+```
+project/
+├── main.py
+├── collector.py
+├── Preprocessing.py
+├── classifier.py
+├── training/
+│   ├── Final_train.py
+│   ├── PREPRO.py
+│   └── Data/
+│       ├── 01/01.txt
+│       ├── 02/02.txt
+│       └── ...
+├── CNN-LSTM_ts.pt        # created by training
+└── scaler.pkl            # created by training
+```
+ 
+`PREPRO.preprocess` loads recordings with the pattern `Data/*/*.txt`, so each recording lives in its own numbered subfolder.
+ 
+---
+
+## Installation
+
+Recommended Python version: 3.11+
+
+'''bash
+pip install numpy pandas scipy pyserial torch
+'''
+Optional, only if you load other model formats in the Classify tab: `tensorflow` (`.keras`/`.h5`), `onnxruntime` (`.onnx`), `joblib`/`scikit-learn` (`.pkl`/`.joblib`). `tkinter` ships with Python.
+ 
+Training uses a GPU automatically if CUDA is available, otherwise the CPU.
+ 
+---
