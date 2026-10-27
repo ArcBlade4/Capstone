@@ -33,7 +33,7 @@ sns.heatmap(emg_matrix,                #Data
 plt.title('sEMG Heatmap Matrix (Position #)', fontsize=14, fontweight='bold')
 plt.ylabel('Channels')
 plt.xlabel('Time (Milliseconds)')
-plt.xticks(ticks=tick_positions[::30], labels=time_axis[::30])           #only show every 30th tick and tick labels on the x axis to avoid cluttering the x-axis
+plt.xticks(ticks=tick_positions[::300], labels=time_axis[::300])           #only show every 30th tick and tick labels on the x axis to avoid cluttering the x-axis
 plt.yticks(ticks=np.arange(8) + 0.5, labels=emg_channels, rotation=0)    #Position the y tick labels in the middle of each row for each channel
 plt.tight_layout()
 plt.show()
