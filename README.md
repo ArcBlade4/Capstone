@@ -66,8 +66,8 @@ project/
 Recommended Python version: 3.11+
 
 ```bash
-pip install numpy pandas scipy pyserial torch
-```
+pip install numpy pandas scipy pyserial torch matplotlib
+``` 
 Training uses a GPU automatically if CUDA is available, otherwise the CPU.
  
 ---
