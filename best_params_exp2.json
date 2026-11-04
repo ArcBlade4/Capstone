@@ -1,0 +1,32 @@
+{
+ "LSTM": {
+  "lr": 0.006515704049773883,
+  "weight_decay": 0.004417650756386803,
+  "batch_size": 32,
+  "dropout": 0.04476586509270429,
+  "hidden": 256,
+  "layers": 3
+ },
+ "CNN": {
+  "lr": 0.007194663862478477,
+  "weight_decay": 2.5098439300345367e-05,
+  "batch_size": 128,
+  "dropout": 0.3709808663710777,
+  "width": 128,
+  "kernel_size": 7,
+  "n_layers": 2
+ },
+ "CNN-LSTM": {
+  "lr": 0.0017498203096193681,
+  "weight_decay": 0.0024938698165454802,
+  "batch_size": 64,
+  "dropout": 0.04258517387140784,
+  "width": 64,
+  "kernel_size": 5,
+  "hidden": 128,
+  "cnn_layers": 1,
+  "stride": 2,
+  "lstm_layers": 1,
+  "use_features": true
+ }
+}
